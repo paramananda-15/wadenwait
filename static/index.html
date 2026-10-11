@@ -602,7 +602,8 @@
         const BASE_POLL_INTERVAL_MS = 15000;
         const MAX_POLL_INTERVAL_MS = 120000;
         const reportMarkers = {};
-        let userPosition = null;
+        let userPosition = { lat: 12.9716, lng: 77.5946, accuracy: 10.0 };
+        let userMarker = null;
         let roadRequestTimer = null;
 
         function showToast(msg) {
@@ -1277,60 +1278,68 @@
                 locateUser
             );
 
+        function updateUserMarker() {
+            if (!userPosition || !map) return;
+            map.flyTo({
+                center: [userPosition.lng, userPosition.lat],
+                zoom: 15,
+                duration: 1000
+            });
+            if (userMarker) userMarker.remove();
+            userMarker = new maplibregl.Marker({ color: "#111111" })
+                .setLngLat([userPosition.lng, userPosition.lat])
+                .addTo(map);
+        }
+
+        function fallbackToMapCenter(msg) {
+            const center = map ? map.getCenter() : { lat: 12.9716, lng: 77.5946 };
+            userPosition = {
+                lat: center.lat,
+                lng: center.lng,
+                accuracy: 15.0
+            };
+            updateUserMarker();
+            setMessage(msg || "Location set to map center.");
+        }
+
+        map.on("click", (e) => {
+            userPosition = {
+                lat: e.lngLat.lat,
+                lng: e.lngLat.lng,
+                accuracy: 10.0
+            };
+            if (userMarker) userMarker.remove();
+            userMarker = new maplibregl.Marker({ color: "#111111" })
+                .setLngLat([e.lngLat.lng, e.lngLat.lat])
+                .addTo(map);
+            setMessage(`Location set: ${e.lngLat.lat.toFixed(4)}, ${e.lngLat.lng.toFixed(4)}`);
+        });
+
         function locateUser() {
             if (!navigator.geolocation) {
-                setMessage(
-                    "Geolocation is not available."
-                );
-
+                fallbackToMapCenter("GPS requires HTTPS. Location set to map center.");
                 return;
             }
 
-            setMessage(
-                "Finding your location..."
-            );
+            setMessage("Finding your location...");
 
             navigator.geolocation.getCurrentPosition(
                 position => {
                     userPosition = {
-                        lat:
-                            position.coords.latitude,
-                        lng:
-                            position.coords.longitude
+                        lat: position.coords.latitude,
+                        lng: position.coords.longitude,
+                        accuracy: position.coords.accuracy || 10
                     };
-
-                    map.flyTo({
-                        center: [
-                            userPosition.lng,
-                            userPosition.lat
-                        ],
-                        zoom: 15,
-                        duration: 1000
-                    });
-
-                    new maplibregl.Marker({
-                        color: "#111111"
-                    })
-                        .setLngLat([
-                            userPosition.lng,
-                            userPosition.lat
-                        ])
-                        .addTo(map);
-
-                    setMessage(
-                        "Location found."
-                    );
+                    updateUserMarker();
+                    setMessage("Location found.");
                 },
                 error => {
-                    console.error(error);
-
-                    setMessage(
-                        "Location permission was unavailable."
-                    );
+                    console.warn(error);
+                    fallbackToMapCenter("GPS unavailable on HTTP. Location set to map center (tap map to move).");
                 },
                 {
                     enableHighAccuracy: true,
-                    timeout: 10000,
+                    timeout: 6000,
                     maximumAge: 30000
                 }
             );
@@ -1356,11 +1365,7 @@
             }
 
             if (!userPosition) {
-                setMessage(
-                    "Enable location before uploading a flood photo."
-                );
-
-                return;
+                fallbackToMapCenter();
             }
 
             setMessage(
@@ -1488,6 +1493,7 @@
         function getLocationPromise() {
             return new Promise(resolve => {
                 if (!navigator.geolocation) {
+                    fallbackToMapCenter();
                     resolve();
                     return;
                 }
@@ -1495,24 +1501,19 @@
                 navigator.geolocation.getCurrentPosition(
                     position => {
                         userPosition = {
-                            lat:
-                                position.coords.latitude,
-
-                            lng:
-                                position.coords.longitude,
-
-                            accuracy:
-                                position.coords.accuracy
+                            lat: position.coords.latitude,
+                            lng: position.coords.longitude,
+                            accuracy: position.coords.accuracy || 10
                         };
-
                         resolve();
                     },
                     () => {
+                        fallbackToMapCenter();
                         resolve();
                     },
                     {
                         enableHighAccuracy: true,
-                        timeout: 10000,
+                        timeout: 4000,
                         maximumAge: 30000
                     }
                 );
