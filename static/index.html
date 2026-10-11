@@ -1392,32 +1392,28 @@
                 const uploadInfo =
                     await uploadUrlResponse.json();
 
-                const formData =
-                    new FormData();
-
-                formData.append(
-                    "key",
-                    uploadInfo.key
-                );
-
-                formData.append(
-                    "file",
-                    file,
-                    "photo.jpg"
-                );
-
-                const uploadResponse =
-                    await fetch(
-                        `${API}${uploadInfo.url}`,
-                        {
-                            method: "POST",
-                            body: formData
-                        }
-                    );
+                let uploadResponse;
+                if (uploadInfo.url && uploadInfo.url.startsWith("http")) {
+                    uploadResponse = await fetch(uploadInfo.url, {
+                        method: "PUT",
+                        headers: {
+                            "Content-Type": "image/jpeg"
+                        },
+                        body: file
+                    });
+                } else {
+                    const formData = new FormData();
+                    formData.append("key", uploadInfo.key);
+                    formData.append("file", file, "photo.jpg");
+                    uploadResponse = await fetch(`${API}${uploadInfo.url}`, {
+                        method: "POST",
+                        body: formData
+                    });
+                }
 
                 if (!uploadResponse.ok) {
                     throw new Error(
-                        "Photo upload failed."
+                        `Photo upload failed (${uploadResponse.status}).`
                     );
                 }
 
@@ -1483,7 +1479,7 @@
                 console.error(error);
 
                 setMessage(
-                    "Could not analyze the photo."
+                    error.message || "Could not analyze the photo."
                 );
             }
 
