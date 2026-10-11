@@ -27,8 +27,15 @@ def get_bucket_name() -> str:
 
 def _get_s3_client():
     import boto3
+    from botocore.client import Config
     region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION", "ap-south-1")
-    return boto3.client("s3", region_name=region)
+    endpoint_url = f"https://s3.{region}.amazonaws.com"
+    return boto3.client(
+        "s3",
+        region_name=region,
+        endpoint_url=endpoint_url,
+        config=Config(s3={"addressing_style": "virtual"}, signature_version="s3v4"),
+    )
 
 
 def generate_object_key(prefix: str = "photos", extension: str = "jpg") -> str:

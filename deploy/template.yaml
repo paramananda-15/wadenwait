@@ -27,6 +27,11 @@ Parameters:
     Default: 100
     Description: Global atomic daily cap on vision analysis model calls
 
+  DeployVersion:
+    Type: String
+    Default: "1"
+    Description: Incremental deployment version to trigger EC2 instance refresh
+
   AlertEmail:
     Type: String
     Default: ""
@@ -199,6 +204,7 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
       Policies:
         - PolicyName: AppInstanceLeastPrivilegePolicy
           PolicyDocument:
@@ -284,6 +290,7 @@ Resources:
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
+          # Deploy Version: ${DeployVersion}
           exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
           echo "Starting initialization at $(date)"
           dnf update -y

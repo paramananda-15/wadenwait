@@ -85,8 +85,8 @@ docker build --build-arg INCLUDE_DETECTOR=0 -t "$IMAGE_URI" .
 docker push "$IMAGE_URI"
 
 echo -e "\n=== 6. Deploying CloudFormation Stack ($STACK_NAME) ==="
-# Notice: Never echo PARAMS or the secret key
-PARAMS="ImageUri=$IMAGE_URI VisionApiBaseUrl=$VISION_API_BASE_URL VisionModel=$VISION_MODEL VisionApiKey=$VISION_API_KEY DailyAnalysisCap=$DAILY_CAP"
+DEPLOY_VER=$(date +%s)
+PARAMS="ImageUri=$IMAGE_URI VisionApiBaseUrl=$VISION_API_BASE_URL VisionModel=$VISION_MODEL VisionApiKey=$VISION_API_KEY DailyAnalysisCap=$DAILY_CAP DeployVersion=$DEPLOY_VER"
 if [ -n "$ALERT_EMAIL" ]; then
     PARAMS="$PARAMS AlertEmail=$ALERT_EMAIL"
 fi
