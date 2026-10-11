@@ -461,6 +461,15 @@
         >
             Vision model: —
         </div>
+
+        <div id="explanationContainer" style="margin-top:12px; display:none;">
+            <div style="font-size:10px; color:#888; text-transform:uppercase; margin-bottom:4px;">
+                Detector Cross-check & Explanation
+            </div>
+            <img id="explanationImage" style="width:100%; border-radius:8px; border:1px solid rgba(255,255,255,0.15); max-height:220px; object-fit:contain; background:#111; display:none;" alt="Explanation image">
+            <div id="explanationReason" style="margin-top:6px; font-size:12px; color:#eee; line-height:1.4;"></div>
+            <div id="analysisProvenance" style="margin-top:4px; font-size:11px; color:#888;"></div>
+        </div>
     </div>
 
     <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
@@ -1118,10 +1127,40 @@
             document.getElementById(
                 "analysisModel"
             ).textContent =
-                `Vision model: ${model}` +
+                `Perception: ${result.perception_mode || "vlm"} • Model: ${model}` +
                 (result.perception_mode === "stub"
                     ? " (STATIC DEMO DATA)"
                     : " (LIVE LOCAL ANALYSIS)");
+
+            const expContainer = document.getElementById("explanationContainer");
+            const expImg = document.getElementById("explanationImage");
+            const expReason = document.getElementById("explanationReason");
+            const expProv = document.getElementById("analysisProvenance");
+
+            if (result.explanation_image_url || result.explanation_reason) {
+                expContainer.style.display = "block";
+                if (result.explanation_image_url) {
+                    expImg.src = result.explanation_image_url;
+                    expImg.style.display = "block";
+                } else {
+                    expImg.style.display = "none";
+                }
+                expReason.textContent = result.explanation_reason || "";
+
+                const provParts = [];
+                if (result.agreement) {
+                    provParts.push(`Agreement: ${result.agreement}`);
+                }
+                if (result.vlm_interval) {
+                    provParts.push(`VLM: ${result.vlm_interval[0]}–${result.vlm_interval[1]} cm`);
+                }
+                if (result.detector_interval) {
+                    provParts.push(`Detector: ${result.detector_interval[0]}–${result.detector_interval[1]} cm`);
+                }
+                expProv.textContent = provParts.join(" • ");
+            } else {
+                expContainer.style.display = "none";
+            }
 
             panel.classList.add(
                 "show"

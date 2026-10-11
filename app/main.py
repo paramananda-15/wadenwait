@@ -28,6 +28,8 @@ from .common import (
     perception,
     safety,
     environment,
+    detector,
+    fusion,
 )
 
 ROOT = (
@@ -683,7 +685,7 @@ def health():
         "perception_mode":
             os.getenv(
                 "PERCEPTION_MODE",
-                "ollama",
+                "vlm",
             ),
         "ollama_model":
             os.getenv(
@@ -786,127 +788,230 @@ def report(req: ReportRequest):
         )
 
     image = path.read_bytes()
+    mode_env = os.getenv("PERCEPTION_MODE", "vlm").strip().lower()
 
-    obs = perception.observe(image)
+    if mode_env == "fusion":
+        obs = perception.observe(image)
+        det_raw = detector.detect(image)
+        det_est = detector.estimate_depth_visible_height(det_raw)
 
-    print(
-        "Perception mode:",
-        obs.get("mode"),
-        "model:",
-        obs.get("model"),
-    )
-
-    if obs["image_usable"]:
-        est = geometry.estimate(
-            obs["objects"],
-            obs["overall_confidence"],
+        adj_vlm_conf, _ = detector.cross_check_vlm(
+            obs.get("objects", []),
+            det_raw.get("detections", []),
+            obs.get("overall_confidence", 0.0),
         )
-    else:
-        est = None
 
-    if not est:
+        if obs.get("image_usable"):
+            est = geometry.estimate(obs["objects"], adj_vlm_conf)
+            vlm_interval = [est["depth_lo"], est["depth_hi"]] if est else None
+            vlm_conf = est["conf"] if est else 0.0
+        else:
+            est = None
+            vlm_interval = None
+            vlm_conf = 0.0
+
+        det_interval = det_est.get("depth_interval")
+        det_conf = det_est.get("confidence", 0.0)
+
+        fused = fusion.fuse(
+            vlm_interval,
+            vlm_conf,
+            det_interval,
+            det_conf,
+            modes=MODES,
+            flow=obs.get("flow", "fast"),
+        )
+
+        exp_filename = f"explanation_{filename}"
+        exp_path = UPLOADS / exp_filename
+        _, reason = detector.create_explanation_image(
+            image,
+            det_est,
+            save_path=exp_path,
+        )
+        explanation_url = f"/uploads/{exp_filename}"
+
+        has_depth = fused["fused_interval"] is not None
+        depth_cm = fused["fused_interval"] if has_depth else [0, 0]
+        band = (
+            geometry.band((depth_cm[0] + depth_cm[1]) / 2)
+            if has_depth
+            else "unknown"
+        )
+
         result = {
-            "image_usable":
-                False,
-
-            "band":
-                "unknown",
-
-            "depth_cm":
-                [0, 0],
-
-            "confidence":
-                0,
-
-            "verdicts": {
-                mode:
-                    "UNKNOWN"
-                for mode in MODES
-            },
-
-            "flow":
-                obs.get(
-                    "flow",
-                    "fast",
-                ),
-
-            "reports":
-                1,
-
-            "perception_mode":
-                obs.get("mode", "ollama"),
-
-            "perception_model":
-                obs.get("model"),
-
-            "perception_reasons":
-                obs.get(
-                    "reasons_if_unusable",
-                    [],
-                ),
+            "image_usable": bool(has_depth),
+            "band": band,
+            "depth_cm": depth_cm,
+            "confidence": fused["fused_confidence"],
+            "verdicts": fused["verdicts"],
+            "flow": obs.get("flow", "fast"),
+            "reports": 1,
+            "perception_mode": "fusion",
+            "perception_model": obs.get("model"),
+            "perception_reasons": obs.get("reasons_if_unusable", []),
+            "vlm_interval": fused["vlm_interval"],
+            "detector_interval": fused["detector_interval"],
+            "agreement": fused["agreement"],
+            "explanation_image_url": explanation_url,
+            "explanation_reason": reason,
         }
 
     else:
-        verdicts = {}
+        # Default VLM mode: existing behavior unchanged
+        obs = perception.observe(image)
 
-        for mode in MODES:
-            verdicts[mode] = safety.verdict(
-                est["depth_lo"],
-                est["depth_hi"],
-                est["conf"],
-                mode,
-                obs.get(
-                    "flow",
-                    "fast",
-                ),
+        print(
+            "Perception mode:",
+            obs.get("mode"),
+            "model:",
+            obs.get("model"),
+        )
+
+        if obs["image_usable"]:
+            est = geometry.estimate(
+                obs["objects"],
+                obs["overall_confidence"],
             )
+        else:
+            est = None
 
-        result = {
-            "image_usable":
-                True,
+        if not est:
+            result = {
+                "image_usable":
+                    False,
 
-            "band":
-                geometry.band(
-                    (
-                        est["depth_lo"]
-                        + est["depth_hi"]
-                    )
-                    / 2
-                ),
+                "band":
+                    "unknown",
 
-            "depth_cm":
-                [
+                "depth_cm":
+                    [0, 0],
+
+                "confidence":
+                    0,
+
+                "verdicts": {
+                    mode:
+                        "UNKNOWN"
+                    for mode in MODES
+                },
+
+                "flow":
+                    obs.get(
+                        "flow",
+                        "fast",
+                    ),
+
+                "reports":
+                    1,
+
+                "perception_mode":
+                    obs.get("mode", "vlm"),
+
+                "perception_model":
+                    obs.get("model"),
+
+                "perception_reasons":
+                    obs.get(
+                        "reasons_if_unusable",
+                        [],
+                    ),
+
+                "vlm_interval":
+                    None,
+
+                "detector_interval":
+                    None,
+
+                "agreement":
+                    "detector_unavailable",
+
+                "explanation_image_url":
+                    None,
+
+                "explanation_reason":
+                    None,
+            }
+
+        else:
+            verdicts = {}
+
+            for mode in MODES:
+                verdicts[mode] = safety.verdict(
                     est["depth_lo"],
                     est["depth_hi"],
-                ],
+                    est["conf"],
+                    mode,
+                    obs.get(
+                        "flow",
+                        "fast",
+                    ),
+                )
 
-            "confidence":
-                est["conf"],
+            result = {
+                "image_usable":
+                    True,
 
-            "verdicts":
-                verdicts,
+                "band":
+                    geometry.band(
+                        (
+                            est["depth_lo"]
+                            + est["depth_hi"]
+                        )
+                        / 2
+                    ),
 
-            "flow":
-                obs.get(
-                    "flow",
-                    "fast",
-                ),
+                "depth_cm":
+                    [
+                        est["depth_lo"],
+                        est["depth_hi"],
+                    ],
 
-            "reports":
-                1,
+                "confidence":
+                    est["conf"],
 
-            "perception_mode":
-                obs.get("mode", "ollama"),
+                "verdicts":
+                    verdicts,
 
-            "perception_model":
-                obs.get("model"),
+                "flow":
+                    obs.get(
+                        "flow",
+                        "fast",
+                    ),
 
-            "perception_reasons":
-                obs.get(
-                    "reasons_if_unusable",
-                    [],
-                ),
-        }
+                "reports":
+                    1,
+
+                "perception_mode":
+                    obs.get("mode", "vlm"),
+
+                "perception_model":
+                    obs.get("model"),
+
+                "perception_reasons":
+                    obs.get(
+                        "reasons_if_unusable",
+                        [],
+                    ),
+
+                "vlm_interval":
+                    [
+                        est["depth_lo"],
+                        est["depth_hi"],
+                    ],
+
+                "detector_interval":
+                    None,
+
+                "agreement":
+                    "detector_unavailable",
+
+                "explanation_image_url":
+                    None,
+
+                "explanation_reason":
+                    None,
+            }
 
     db.insert({
         "key":
@@ -1418,6 +1523,14 @@ app.mount(
         directory=STATIC_DIR,
     ),
     name="static",
+)
+
+app.mount(
+    "/uploads",
+    StaticFiles(
+        directory=UPLOADS,
+    ),
+    name="uploads",
 )
 
 

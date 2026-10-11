@@ -33,6 +33,10 @@ repeatable; `openrouter/free` picks a random model each call. Output: `eval/resu
 - CloudWatch: custom metrics from `emf.py` (6 outcomes) fit the 10 free metrics; first 3 dashboards are free.
 - Tiles are OpenStreetMap's public tile server: fine for a demo, not for production traffic.
 
-## Placeholders you must replace
-`common/safety.py` LIMITS and `common/geometry.py` TABLE are illustrative. Add cited sources before any real use.
-`common/bedrock.py` is unused leftover code (Bedrock is not free); delete it if you don't need it.
+## Object Detector & Weights License (Feature 1)
+- Model: `torchvision.models.detection.ssdlite320_mobilenet_v3_large` pre-trained on COCO train2017.
+- Model Code License: BSD 3-Clause License (PyTorch / Torchvision).
+- Pre-trained Weights License: Trained on the COCO dataset (annotations licensed under Creative Commons Attribution 4.0 International — CC BY 4.0). Weights distributed by PyTorch under permissive open-source terms.
+- Supported classes: `car`, `motorcycle`, `bicycle`, `person`, `bus`, `truck`, `stop sign`.
+- Perception modes: `PERCEPTION_MODE=vlm` (default, backward-compatible VLM only) or `PERCEPTION_MODE=fusion` (cross-check and interval fusion with detector visible-height estimation and explanation image).
+
