@@ -22,7 +22,7 @@ def fuse(
     det_interval: Optional[List[float]],
     det_conf: float,
     modes: List[str],
-    flow: str = "fast",
+    flow: str = "still",
 ) -> Dict[str, Any]:
     """
     Fuse VLM depth interval and detector depth interval.

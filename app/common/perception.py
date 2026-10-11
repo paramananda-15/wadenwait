@@ -66,7 +66,7 @@ def sanitize(raw):
         "image_usable": False,
         "reasons_if_unusable": ["unreadable model output"],
         "objects": [],
-        "flow": "fast",
+        "flow": "still",
         "water_clarity": "muddy",
         "overall_confidence": 0.0,
         "model": os.getenv("OLLAMA_MODEL", "qwen2.5vl:7b"),
@@ -130,7 +130,7 @@ def sanitize(raw):
                     "slow",
                     "fast",
                 )
-                else "fast"
+                else "still"
             ),
             "water_clarity": (
                 "clear"
@@ -213,7 +213,7 @@ def observe(image_bytes):
                 + str(exc)[:180]
             ],
             "objects": [],
-            "flow": "fast",
+            "flow": "still",
             "water_clarity": "muddy",
             "overall_confidence": 0.0,
             "model": os.getenv(

@@ -174,16 +174,16 @@ def estimate_reference_depth(
 
 def vehicle_threshold(mode):
     thresholds = {
-        "pedestrian": 10.0,
-        "two_wheeler": 15.0,
-        "hatchback": 25.0,
-        "suv": 40.0,
-        "ambulance": 35.0
+        "pedestrian": 12.0,
+        "two_wheeler": 42.0,
+        "hatchback": 32.0,
+        "suv": 60.0,
+        "ambulance": 45.0,
     }
 
     return thresholds.get(
         mode,
-        25.0
+        32.0,
     )
 
 
@@ -194,6 +194,20 @@ def vehicle_verdict(
 ):
     threshold = vehicle_threshold(mode)
     depth_cm = float(depth_cm)
+
+    if mode == "two_wheeler":
+        if depth_cm <= 14.0:
+            return "GO"
+        if depth_cm <= threshold:
+            return "CAUTION"
+        return "DO NOT CROSS"
+
+    if mode == "suv":
+        if depth_cm <= 42.0:
+            return "GO"
+        if depth_cm <= threshold:
+            return "CAUTION"
+        return "DO NOT CROSS"
 
     if depth_cm <= threshold * 0.65:
         return "GO"

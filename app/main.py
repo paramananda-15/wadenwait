@@ -374,6 +374,24 @@ def classify_road(depth_cm, mode):
 
     depth_cm = float(depth_cm)
 
+    if mode == "two_wheeler":
+        if depth_cm <= 14.0:
+            return "PASSABLE"
+        if depth_cm <= threshold:
+            return "CAUTION"
+        if depth_cm <= threshold * 1.5:
+            return "FLOODED"
+        return "BLOCKED"
+
+    if mode == "suv":
+        if depth_cm <= 42.0:
+            return "PASSABLE"
+        if depth_cm <= threshold:
+            return "CAUTION"
+        if depth_cm <= threshold * 1.5:
+            return "FLOODED"
+        return "BLOCKED"
+
     if depth_cm <= threshold * 0.65:
         return "PASSABLE"
 
@@ -549,21 +567,14 @@ def build_road_features(
             clearance = None
 
             if usable_active:
-                depths = [
-                    (
-                        float(
-                            item[1]["depth_lo"]
-                        )
-                        +
-                        float(
-                            item[1]["depth_hi"]
-                        )
-                    ) / 2.0
-                    for item
-                    in usable_active
-                ]
-
-                max_depth = max(depths)
+                latest_item = max(
+                    usable_active,
+                    key=lambda item: item[1].get("captured_at") or 0,
+                )
+                max_depth = (
+                    float(latest_item[1]["depth_lo"])
+                    + float(latest_item[1]["depth_hi"])
+                ) / 2.0
 
                 confidence = max(
                     float(
@@ -1021,7 +1032,7 @@ def report(req: ReportRequest):
             det_interval,
             det_conf,
             modes=MODES,
-            flow=obs.get("flow", "fast"),
+            flow=obs.get("flow", "still"),
         )
 
         exp_filename = f"explanation_{filename}"
@@ -1047,7 +1058,7 @@ def report(req: ReportRequest):
             "depth_cm": depth_cm,
             "confidence": fused["fused_confidence"],
             "verdicts": fused["verdicts"],
-            "flow": obs.get("flow", "fast"),
+            "flow": obs.get("flow", "still"),
             "reports": 1,
             "perception_mode": "fusion",
             "perception_model": obs.get("model"),
@@ -1089,7 +1100,7 @@ def report(req: ReportRequest):
                     det_est.get("depth_interval"),
                     det_est.get("confidence", 0.0),
                     modes=MODES,
-                    flow=obs.get("flow", "fast"),
+                    flow=obs.get("flow", "still"),
                 )
                 exp_filename = f"explanation_{filename}"
                 exp_path = UPLOADS / exp_filename
@@ -1107,7 +1118,7 @@ def report(req: ReportRequest):
                     "depth_cm": depth_cm,
                     "confidence": fused["fused_confidence"],
                     "verdicts": fused["verdicts"],
-                    "flow": obs.get("flow", "fast"),
+                    "flow": obs.get("flow", "still"),
                     "reports": 1,
                     "perception_mode": "fusion_fallback",
                     "perception_model": "detector",
@@ -1141,7 +1152,7 @@ def report(req: ReportRequest):
                     "flow":
                         obs.get(
                             "flow",
-                            "fast",
+                            "still",
                         ),
 
                     "reports":
@@ -1186,7 +1197,7 @@ def report(req: ReportRequest):
                     mode,
                     obs.get(
                         "flow",
-                        "fast",
+                        "still",
                     ),
                 )
 
@@ -1218,7 +1229,7 @@ def report(req: ReportRequest):
                 "flow":
                     obs.get(
                         "flow",
-                        "fast",
+                        "still",
                     ),
 
                 "reports":
@@ -1475,7 +1486,7 @@ def map_pins(
             target_rows[0]["flow"]
             if "flow"
             in target_rows[0].keys()
-            else "fast"
+            else "still"
         )
 
         verdicts = {}
