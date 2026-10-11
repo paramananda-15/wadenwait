@@ -6,6 +6,12 @@ import math
 import urllib.parse
 import urllib.request
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 from pathlib import Path
 from typing import Optional
 
@@ -15,6 +21,7 @@ from fastapi import (
     Form,
     UploadFile,
     HTTPException,
+    Request,
 )
 
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,6 +38,7 @@ from .common import (
     detector,
     fusion,
 )
+from .common.rate_limit import check_rate_limit
 
 ROOT = (
     Path(__file__)
@@ -103,6 +111,9 @@ class ReportRequest(BaseModel):
 
 class ConfirmRequest(BaseModel):
     status: str
+    lat: float
+    lng: float
+    accuracy: float
     deviceId: Optional[str] = None
     device_id: Optional[str] = None
 
@@ -458,6 +469,12 @@ def build_road_features(
             "status":
                 "UNKNOWN",
 
+            "status_label":
+                "Unknown",
+
+            "is_stale":
+                False,
+
             "depth_cm":
                 None,
 
@@ -513,113 +530,210 @@ def build_road_features(
                     item[0]
             )
 
-            # Conservative road status:
-            # use the highest observed depth.
-            depths = [
-                (
-                    float(
-                        item[1]["depth_lo"]
-                    )
-                    +
-                    float(
-                        item[1]["depth_hi"]
-                    )
-                ) / 2.0
-                for item
-                in matching
+            active_matches = [m for m in matching if not m[1].get("cleared")]
+            cleared_matches = [m for m in matching if m[1].get("cleared")]
+            usable_active = [
+                m for m in active_matches
+                if (
+                    bool(m[1].get("image_usable"))
+                    or float(m[1].get("confidence", 0.0)) > 0.0
+                    or float(m[1].get("depth_hi", 0.0)) > 0.0
+                )
             ]
-
-            max_depth = max(depths)
-
-            confidence = max(
-                float(
-                    item[1]["confidence"]
-                )
-                for item
-                in matching
-            )
-
-            timestamps = [
-                item[1]["captured_at"]
-                for item
-                in matching
-                if item[1]["captured_at"]
-                is not None
-            ]
-
-            # Use the closest flood observation as the
-            # weather location for this road.
-            closest_report = matching[0][1]
-
-            try:
-                clearance = (
-                    environment
-                    .estimate_road_clearance(
-                        closest_report["lat"],
-                        closest_report["lng"],
-                        max_depth,
-                        mode,
-                        road["highway"],
-                    )
-                )
-
-            except Exception as exc:
-                print(
-                    "Road weather/clearance error:",
-                    road["id"],
-                    repr(exc),
-                )
-
-                clearance = None
 
             now_ts = int(time.time())
-            last_verified_ts = max(
-                (item[1].get("last_verified") or item[1].get("captured_at") or now_ts)
-                for item in matching
-            )
-            age_sec = max(0, now_ts - last_verified_ts)
-            age_min = round(age_sec / 60)
-            fade = max(0.35, min(1.0, 1.0 - (age_sec / (180.0 * 60.0)) * 0.65))
+            stale_threshold_sec = int(os.getenv("STALE_THRESHOLD_SECONDS", 3600))
+            clearance = None
 
-            properties.update({
-                "status":
-                    classify_road(
-                        max_depth,
-                        mode,
-                    ),
+            if usable_active:
+                depths = [
+                    (
+                        float(
+                            item[1]["depth_lo"]
+                        )
+                        +
+                        float(
+                            item[1]["depth_hi"]
+                        )
+                    ) / 2.0
+                    for item
+                    in usable_active
+                ]
 
-                "depth_cm":
-                    round(
-                        max_depth,
-                        1,
-                    ),
+                max_depth = max(depths)
 
-                "reports":
-                    len(matching),
+                confidence = max(
+                    float(
+                        item[1]["confidence"]
+                    )
+                    for item
+                    in usable_active
+                )
 
-                "confidence":
-                    round(
-                        confidence,
-                        2,
-                    ),
+                timestamps = [
+                    item[1]["captured_at"]
+                    for item
+                    in usable_active
+                    if item[1]["captured_at"]
+                    is not None
+                ]
 
-                "last_reported":
-                    max(timestamps)
-                    if timestamps
-                    else None,
+                closest_report = usable_active[0][1]
 
-                "last_verified":
-                    last_verified_ts,
+                last_verified_ts = max(
+                    (item[1].get("last_verified") or item[1].get("captured_at") or now_ts)
+                    for item in usable_active
+                )
+                age_sec = max(0, now_ts - last_verified_ts)
+                age_min = round(age_sec / 60)
+                fade = max(0.35, min(1.0, 1.0 - (age_sec / (180.0 * 60.0)) * 0.65))
 
-                "last_verified_minutes":
-                    age_min,
+                is_stale = age_sec >= stale_threshold_sec
+                classified_status = classify_road(
+                    max_depth,
+                    mode,
+                )
 
-                "opacity":
-                    round(fade, 2),
+                if is_stale:
+                    road_status = "STALE"
+                    status_label = "Stale - verify before crossing"
+                else:
+                    road_status = classified_status
+                    status_label = classified_status
 
-                "report_id":
-                    closest_report.get("id"),
-            })
+                try:
+                    clearance = (
+                        environment
+                        .estimate_road_clearance(
+                            closest_report["lat"],
+                            closest_report["lng"],
+                            max_depth,
+                            mode,
+                            road["highway"],
+                        )
+                    )
+                except Exception as exc:
+                    print(
+                        "Road weather/clearance error:",
+                        road["id"],
+                        repr(exc),
+                    )
+                    clearance = None
+
+                properties.update({
+                    "status":
+                        road_status,
+
+                    "status_label":
+                        status_label,
+
+                    "is_stale":
+                        is_stale,
+
+                    "flood_status":
+                        classified_status,
+
+                    "depth_cm":
+                        round(
+                            max_depth,
+                            1,
+                        ),
+
+                    "reports":
+                        len(matching),
+
+                    "confidence":
+                        round(
+                            confidence,
+                            2,
+                        ),
+
+                    "last_reported":
+                        max(timestamps)
+                        if timestamps
+                        else None,
+
+                    "last_verified":
+                        last_verified_ts,
+
+                    "last_verified_minutes":
+                        age_min,
+
+                    "opacity":
+                        round(fade, 2),
+
+                    "report_id":
+                        closest_report.get("id"),
+                })
+
+            elif cleared_matches:
+                closest_report = cleared_matches[0][1]
+
+                confidence = max(
+                    float(
+                        item[1]["confidence"]
+                    )
+                    for item
+                    in cleared_matches
+                )
+
+                timestamps = [
+                    item[1]["captured_at"]
+                    for item
+                    in cleared_matches
+                    if item[1]["captured_at"]
+                    is not None
+                ]
+
+                last_verified_ts = max(
+                    (item[1].get("last_verified") or item[1].get("captured_at") or now_ts)
+                    for item in cleared_matches
+                )
+                age_sec = max(0, now_ts - last_verified_ts)
+                age_min = round(age_sec / 60)
+
+                properties.update({
+                    "status":
+                        "REPORTED_CLEAR",
+
+                    "status_label":
+                        "Reported clear (unverified)",
+
+                    "is_stale":
+                        False,
+
+                    "flood_status":
+                        "PASSABLE",
+
+                    "depth_cm":
+                        0.0,
+
+                    "reports":
+                        len(matching),
+
+                    "confidence":
+                        round(
+                            confidence,
+                            2,
+                        ),
+
+                    "last_reported":
+                        max(timestamps)
+                        if timestamps
+                        else None,
+
+                    "last_verified":
+                        last_verified_ts,
+
+                    "last_verified_minutes":
+                        age_min,
+
+                    "opacity":
+                        0.9,
+
+                    "report_id":
+                        closest_report.get("id"),
+                })
 
             if clearance:
                 current_weather = (
@@ -724,7 +838,7 @@ def health():
         "perception_mode":
             os.getenv(
                 "PERCEPTION_MODE",
-                "vlm",
+                "fusion",
             ),
         "ollama_model":
             os.getenv(
@@ -827,7 +941,7 @@ def report(req: ReportRequest):
         )
 
     image = path.read_bytes()
-    mode_env = os.getenv("PERCEPTION_MODE", "vlm").strip().lower()
+    mode_env = os.getenv("PERCEPTION_MODE", "fusion").strip().lower()
 
     if mode_env == "fusion":
         obs = perception.observe(image)
@@ -916,61 +1030,101 @@ def report(req: ReportRequest):
             est = None
 
         if not est:
-            result = {
-                "image_usable":
-                    False,
-
-                "band":
-                    "unknown",
-
-                "depth_cm":
-                    [0, 0],
-
-                "confidence":
-                    0,
-
-                "verdicts": {
-                    mode:
-                        "UNKNOWN"
-                    for mode in MODES
-                },
-
-                "flow":
-                    obs.get(
-                        "flow",
-                        "fast",
-                    ),
-
-                "reports":
-                    1,
-
-                "perception_mode":
-                    obs.get("mode", "vlm"),
-
-                "perception_model":
-                    obs.get("model"),
-
-                "perception_reasons":
-                    obs.get(
-                        "reasons_if_unusable",
-                        [],
-                    ),
-
-                "vlm_interval":
+            # Fallback to detector if VLM is unavailable or produced no estimate
+            det_raw = detector.detect(image)
+            det_est = detector.estimate_depth_visible_height(det_raw)
+            if det_est.get("depth_interval"):
+                fused = fusion.fuse(
                     None,
+                    0.0,
+                    det_est.get("depth_interval"),
+                    det_est.get("confidence", 0.0),
+                    modes=MODES,
+                    flow=obs.get("flow", "fast"),
+                )
+                exp_filename = f"explanation_{filename}"
+                exp_path = UPLOADS / exp_filename
+                _, reason = detector.create_explanation_image(
+                    image,
+                    det_est,
+                    save_path=exp_path,
+                )
+                explanation_url = f"/uploads/{exp_filename}"
+                depth_cm = fused["fused_interval"]
+                band = geometry.band((depth_cm[0] + depth_cm[1]) / 2)
+                result = {
+                    "image_usable": True,
+                    "band": band,
+                    "depth_cm": depth_cm,
+                    "confidence": fused["fused_confidence"],
+                    "verdicts": fused["verdicts"],
+                    "flow": obs.get("flow", "fast"),
+                    "reports": 1,
+                    "perception_mode": "fusion_fallback",
+                    "perception_model": "detector",
+                    "perception_reasons": obs.get("reasons_if_unusable", []),
+                    "vlm_interval": None,
+                    "detector_interval": fused["detector_interval"],
+                    "agreement": "detector_unavailable",
+                    "explanation_image_url": explanation_url,
+                    "explanation_reason": reason,
+                }
+            else:
+                result = {
+                    "image_usable":
+                        False,
 
-                "detector_interval":
-                    None,
+                    "band":
+                        "unknown",
 
-                "agreement":
-                    "detector_unavailable",
+                    "depth_cm":
+                        [0, 0],
 
-                "explanation_image_url":
-                    None,
+                    "confidence":
+                        0,
 
-                "explanation_reason":
-                    None,
-            }
+                    "verdicts": {
+                        mode:
+                            "UNKNOWN"
+                        for mode in MODES
+                    },
+
+                    "flow":
+                        obs.get(
+                            "flow",
+                            "fast",
+                        ),
+
+                    "reports":
+                        1,
+
+                    "perception_mode":
+                        obs.get("mode", "vlm"),
+
+                    "perception_model":
+                        obs.get("model"),
+
+                    "perception_reasons":
+                        obs.get(
+                            "reasons_if_unusable",
+                            [],
+                        ),
+
+                    "vlm_interval":
+                        None,
+
+                    "detector_interval":
+                        None,
+
+                    "agreement":
+                        "detector_unavailable",
+
+                    "explanation_image_url":
+                        None,
+
+                    "explanation_reason":
+                        None,
+                }
 
         else:
             verdicts = {}
@@ -1111,7 +1265,7 @@ def report(req: ReportRequest):
 
 
 @app.post("/reports/{id}/confirm")
-def confirm_report(id: str, req: ConfirmRequest):
+def confirm_report(id: str, req: ConfirmRequest, request: Request):
     if req.status not in ("still_flooded", "cleared"):
         raise HTTPException(
             status_code=400,
@@ -1119,12 +1273,30 @@ def confirm_report(id: str, req: ConfirmRequest):
         )
 
     device_id = req.deviceId or req.device_id or "unknown_device"
+    client_ip = request.headers.get("x-forwarded-for")
+    if client_ip:
+        client_ip = client_ip.split(",")[0].strip()
+    elif request.client:
+        client_ip = request.client.host
+    else:
+        client_ip = "127.0.0.1"
+
+    # Per-device and per-IP rate limits
+    check_rate_limit(device_id, client_ip)
 
     rep = db.get_report(id)
     if not rep:
         raise HTTPException(
             status_code=404,
             detail="report not found",
+        )
+
+    # Reject votes from devices more than 200 m from the report location
+    dist = haversine_m(req.lat, req.lng, rep["lat"], rep["lng"])
+    if dist > 200.0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Device location is too far from report ({round(dist, 1)}m > 200m).",
         )
 
     res = db.add_vote(id, device_id, req.status)
@@ -1159,7 +1331,8 @@ def map_pins(
             south,
             east,
             north,
-        )
+        ),
+        include_cleared=True,
     )
 
     groups = {}
@@ -1181,31 +1354,36 @@ def map_pins(
         lat,
         lng,
     ), rows_in_group in groups.items():
+        active_rows = [r for r in rows_in_group if not bool(r["cleared"] if "cleared" in r.keys() and r["cleared"] else False)]
+        cleared_rows = [r for r in rows_in_group if bool(r["cleared"] if "cleared" in r.keys() and r["cleared"] else False)]
+
+        target_rows = active_rows if active_rows else cleared_rows
+
         lo = min(
             row["depth_lo"]
             for row
-            in rows_in_group
+            in target_rows
         )
 
         hi = max(
             row["depth_hi"]
             for row
-            in rows_in_group
+            in target_rows
         )
 
         confidence = (
             sum(
                 row["confidence"]
                 for row
-                in rows_in_group
+                in target_rows
             )
-            / len(rows_in_group)
+            / len(target_rows)
         )
 
         flow = (
-            rows_in_group[0]["flow"]
+            target_rows[0]["flow"]
             if "flow"
-            in rows_in_group[0].keys()
+            in target_rows[0].keys()
             else "fast"
         )
 
@@ -1220,12 +1398,48 @@ def map_pins(
                 flow,
             )
 
+        now_ts = int(time.time())
+        stale_threshold_sec = int(os.getenv("STALE_THRESHOLD_SECONDS", 3600))
+
+        last_verified_ts = max(
+            (row["last_verified"] if "last_verified" in row.keys() and row["last_verified"] else (row["created_at"] if "created_at" in row.keys() and row["created_at"] else now_ts))
+            for row in target_rows
+        )
+        age_sec = max(0, now_ts - last_verified_ts)
+        age_min = round(age_sec / 60)
+        is_stale = bool(active_rows) and (age_sec >= stale_threshold_sec)
+
+        if not active_rows and cleared_rows:
+            pin_status = "REPORTED_CLEAR"
+            pin_status_label = "Reported clear (unverified)"
+            fade = 0.9
+        elif is_stale:
+            pin_status = "STALE"
+            pin_status_label = "Stale - verify before crossing"
+            fade = max(0.35, min(1.0, 1.0 - (age_sec / (180.0 * 60.0)) * 0.65))
+        else:
+            pin_status = "ACTIVE"
+            pin_status_label = "Active"
+            fade = max(0.35, min(1.0, 1.0 - (age_sec / (180.0 * 60.0)) * 0.65))
+
         pins.append({
             "lat":
                 lat,
 
             "lng":
                 lng,
+
+            "status":
+                pin_status,
+
+            "status_label":
+                pin_status_label,
+
+            "is_stale":
+                is_stale,
+
+            "cleared":
+                not bool(active_rows),
 
             "band":
                 geometry.band(
@@ -1248,25 +1462,16 @@ def map_pins(
                 verdicts,
 
             "last_verified":
-                max(
-                    (row["last_verified"] if "last_verified" in row.keys() and row["last_verified"] else (row["created_at"] if "created_at" in row.keys() and row["created_at"] else int(time.time())))
-                    for row in rows_in_group
-                ),
+                last_verified_ts,
 
             "last_verified_minutes":
-                round(max(0, int(time.time()) - max(
-                    (row["last_verified"] if "last_verified" in row.keys() and row["last_verified"] else (row["created_at"] if "created_at" in row.keys() and row["created_at"] else int(time.time())))
-                    for row in rows_in_group
-                )) / 60),
+                age_min,
 
             "opacity":
-                round(max(0.35, min(1.0, 1.0 - (max(0, int(time.time()) - max(
-                    (row["last_verified"] if "last_verified" in row.keys() and row["last_verified"] else (row["created_at"] if "created_at" in row.keys() and row["created_at"] else int(time.time())))
-                    for row in rows_in_group
-                )) / (180.0 * 60.0)) * 0.65)), 2),
+                round(fade, 2),
 
             "report_id":
-                rows_in_group[0]["id"],
+                target_rows[0]["id"],
         })
 
     return {
@@ -1397,7 +1602,8 @@ def roads(
             south - 0.002,
             east + 0.002,
             north + 0.002,
-        )
+        ),
+        include_cleared=True,
     )
 
     reports = []
@@ -1427,6 +1633,9 @@ def roads(
 
             "last_verified":
                 row["last_verified"] if "last_verified" in row.keys() and row["last_verified"] else row["captured_at"],
+
+            "cleared":
+                bool(row["cleared"]) if "cleared" in row.keys() and row["cleared"] else False,
         })
 
     features = build_road_features(
@@ -1441,6 +1650,8 @@ def roads(
         "FLOODED": 0,
         "BLOCKED": 0,
         "UNKNOWN": 0,
+        "REPORTED_CLEAR": 0,
+        "STALE": 0,
     }
 
     for feature in features:

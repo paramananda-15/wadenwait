@@ -155,12 +155,19 @@ def get_report(report_id: str) -> Optional[sqlite3.Row]:
         ).fetchone()
 
 
+# Configurable constant: A 'cleared' vote must not override a photo report newer than 10 minutes
+PHOTO_PROTECTION_SECONDS = int(
+    os.getenv("PHOTO_PROTECTION_SECONDS", 600)
+)
+
+
 def add_vote(report_id: str, device_id: str, vote: str) -> Dict[str, Any]:
     """
     Record a vote ("still_flooded" | "cleared").
     One vote per device per report; repeats are ignored.
-    - "still_flooded" refreshes report last_verified.
-    - two or more "cleared" votes from different devices mark report as cleared.
+    - "still_flooded" refreshes report last_verified and ensures cleared=0.
+    - two or more "cleared" votes from different devices mark report as cleared,
+      EXCEPT if the photo report is newer than PHOTO_PROTECTION_SECONDS (10 min).
     """
     if vote not in ("still_flooded", "cleared"):
         raise ValueError("Invalid vote. Must be 'still_flooded' or 'cleared'.")
@@ -169,7 +176,7 @@ def add_vote(report_id: str, device_id: str, vote: str) -> Dict[str, Any]:
 
     with conn() as c:
         rep = c.execute(
-            "SELECT id, last_verified, cleared FROM reports WHERE id = ?",
+            "SELECT id, captured_at, created_at, last_verified, cleared FROM reports WHERE id = ?",
             (report_id,),
         ).fetchone()
 
@@ -202,12 +209,16 @@ def add_vote(report_id: str, device_id: str, vote: str) -> Dict[str, Any]:
             (report_id, device_id, vote, now),
         )
 
+        photo_ts = rep["captured_at"] or rep["created_at"] or now
+        photo_age = now - photo_ts
+        is_photo_protected = photo_age < PHOTO_PROTECTION_SECONDS
+
         if vote == "still_flooded":
             c.execute(
-                "UPDATE reports SET last_verified = ? WHERE id = ?",
+                "UPDATE reports SET last_verified = ?, cleared = 0 WHERE id = ?",
                 (now, report_id),
             )
-            is_cleared = bool(rep["cleared"])
+            is_cleared = False
             last_verified = now
 
         elif vote == "cleared":
@@ -221,7 +232,8 @@ def add_vote(report_id: str, device_id: str, vote: str) -> Dict[str, Any]:
             ).fetchone()
             cleared_cnt = cnt_row["cnt"] if cnt_row else 0
 
-            if cleared_cnt >= 2:
+            # Must not override photo report newer than 10 minutes (configurable constant)
+            if cleared_cnt >= 2 and not is_photo_protected:
                 c.execute(
                     "UPDATE reports SET cleared = 1, last_verified = ? WHERE id = ?",
                     (now, report_id),
@@ -229,11 +241,12 @@ def add_vote(report_id: str, device_id: str, vote: str) -> Dict[str, Any]:
                 is_cleared = True
                 last_verified = now
             else:
+                # Vote is counted in report_votes, but photo is recent: keep road marked flooded
                 c.execute(
                     "UPDATE reports SET last_verified = ? WHERE id = ?",
                     (now, report_id),
                 )
-                is_cleared = bool(rep["cleared"])
+                is_cleared = bool(rep["cleared"]) and not is_photo_protected
                 last_verified = now
 
     return {
@@ -243,6 +256,7 @@ def add_vote(report_id: str, device_id: str, vote: str) -> Dict[str, Any]:
         "report_id": report_id,
         "cleared": is_cleared,
         "last_verified": last_verified,
+        "photo_protected": is_photo_protected,
     }
 
 

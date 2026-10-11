@@ -170,6 +170,8 @@
         .yellow { background: #facc15; }
         .red { background: #ef4444; }
         .darkred { background: #7f1d1d; }
+        .blue { background: #0284c7; }
+        .orange { background: #ea580c; }
         .gray { background: #777; }
 
         .analysis-panel {
@@ -384,6 +386,22 @@
 
         <div class="status-row">
             <span>
+                <span class="dot blue"></span>
+                Reported clear
+            </span>
+            <strong id="countReportedClear">0</strong>
+        </div>
+
+        <div class="status-row">
+            <span>
+                <span class="dot orange"></span>
+                Stale
+            </span>
+            <strong id="countStale">0</strong>
+        </div>
+
+        <div class="status-row">
+            <span>
                 <span class="dot gray"></span>
                 No reports
             </span>
@@ -489,14 +507,30 @@
         window.voteReport = async function(reportId, status) {
             if (!reportId) return;
             const msgEl = document.getElementById(`voteMsg_${reportId}`);
-            if (msgEl) msgEl.textContent = "Recording vote...";
+            if (msgEl) msgEl.textContent = "Getting location & recording vote...";
             try {
+                if (!userPosition) {
+                    await getLocationPromise();
+                }
+                if (!userPosition) {
+                    if (msgEl) msgEl.textContent = "Location access required to confirm.";
+                    return;
+                }
                 const res = await fetch(`${API}/reports/${encodeURIComponent(reportId)}/confirm`, {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ status: status, deviceId: getDeviceId() })
+                    body: JSON.stringify({
+                        status: status,
+                        deviceId: getDeviceId(),
+                        lat: userPosition.lat,
+                        lng: userPosition.lng,
+                        accuracy: userPosition.accuracy != null ? userPosition.accuracy : 10.0
+                    })
                 });
-                if (!res.ok) throw new Error("Vote failed");
+                if (!res.ok) {
+                    const errJson = await res.json().catch(() => ({}));
+                    throw new Error(errJson.detail || `Vote failed (${res.status})`);
+                }
                 const data = await res.json();
                 if (msgEl) {
                     if (data.ignored) {
@@ -510,11 +544,12 @@
                 await loadRoads();
             } catch (err) {
                 console.error(err);
-                if (msgEl) msgEl.textContent = "Vote failed. Please try again.";
+                if (msgEl) msgEl.textContent = err.message || "Vote failed. Please try again.";
             }
         };
 
         let selectedVehicle = "hatchback";
+        let currentAnalysisResult = null;
         let userPosition = null;
         let roadRequestTimer = null;
 
@@ -703,6 +738,60 @@
                 }
             });
 
+            map.addLayer({
+                id: "roads-reported-clear",
+                type: "line",
+                source: "flood-roads",
+                filter: [
+                    "==",
+                    ["get", "status"],
+                    "REPORTED_CLEAR"
+                ],
+                paint: {
+                    "line-color": "#0284c7",
+                    "line-width": [
+                        "interpolate",
+                        ["linear"],
+                        ["zoom"],
+                        10, 2,
+                        14, 4,
+                        18, 7
+                    ],
+                    "line-opacity": [
+                        "coalesce",
+                        ["get", "opacity"],
+                        0.9
+                    ]
+                }
+            });
+
+            map.addLayer({
+                id: "roads-stale",
+                type: "line",
+                source: "flood-roads",
+                filter: [
+                    "==",
+                    ["get", "status"],
+                    "STALE"
+                ],
+                paint: {
+                    "line-color": "#ea580c",
+                    "line-width": [
+                        "interpolate",
+                        ["linear"],
+                        ["zoom"],
+                        10, 2.5,
+                        14, 5,
+                        18, 8
+                    ],
+                    "line-opacity": [
+                        "coalesce",
+                        ["get", "opacity"],
+                        0.5
+                    ]
+                }
+            });
+
             loadRoads();
         });
 
@@ -811,6 +900,12 @@
             ).textContent =
                 counts.BLOCKED || 0;
 
+            const repClearEl = document.getElementById("countReportedClear");
+            if (repClearEl) repClearEl.textContent = counts.REPORTED_CLEAR || 0;
+
+            const staleEl = document.getElementById("countStale");
+            if (staleEl) staleEl.textContent = counts.STALE || 0;
+
             document.getElementById(
                 "countUnknown"
             ).textContent =
@@ -874,6 +969,10 @@
                         button.classList.add(
                             "active"
                         );
+
+                        if (currentAnalysisResult && currentAnalysisResult.verdicts) {
+                            renderAnalysisVerdict(currentAnalysisResult);
+                        }
 
                         loadRoads();
                     }
@@ -1116,7 +1215,10 @@
                                 position.coords.latitude,
 
                             lng:
-                                position.coords.longitude
+                                position.coords.longitude,
+
+                            accuracy:
+                                position.coords.accuracy
                         };
 
                         resolve();
@@ -1133,22 +1235,39 @@
             });
         }
 
-        function showAnalysis(result) {
-            const panel =
-                document.getElementById(
-                    "analysisPanel"
-                );
-
+        function renderAnalysisVerdict(result) {
             const verdict =
                 result.verdicts &&
                 result.verdicts[
                     selectedVehicle
                 ];
 
-            document.getElementById(
+            const el = document.getElementById(
                 "analysisVerdict"
-            ).textContent =
-                verdict || "UNKNOWN";
+            );
+            if (!el) return;
+
+            el.textContent = verdict || "UNKNOWN";
+            if (verdict === "GO" || verdict === "PASSABLE") {
+                el.style.color = "#22c55e";
+            } else if (verdict === "CAUTION") {
+                el.style.color = "#facc15";
+            } else if (verdict === "DO_NOT_CROSS" || verdict === "FLOODED" || verdict === "BLOCKED") {
+                el.style.color = "#ef4444";
+            } else {
+                el.style.color = "#888888";
+            }
+        }
+
+        function showAnalysis(result) {
+            currentAnalysisResult = result;
+
+            const panel =
+                document.getElementById(
+                    "analysisPanel"
+                );
+
+            renderAnalysisVerdict(result);
 
             document.getElementById(
                 "analysisDepth"
@@ -1225,6 +1344,7 @@
             .addEventListener(
                 "click",
                 () => {
+                    currentAnalysisResult = null;
                     document
                         .getElementById(
                             "analysisPanel"
@@ -1240,6 +1360,8 @@
             "roads-caution",
             "roads-flooded",
             "roads-blocked",
+            "roads-reported-clear",
+            "roads-stale",
             "roads-unknown"
         ];
 
@@ -1262,6 +1384,9 @@
 
                         const status =
                             p.status;
+
+                        let displayStatus =
+                            p.status_label || status;
 
                         let color =
                             "#777";
@@ -1298,6 +1423,27 @@
                                 "#7f1d1d";
                         }
 
+                        if (
+                            status ===
+                            "REPORTED_CLEAR"
+                        ) {
+                            color =
+                                "#0284c7";
+                            displayStatus =
+                                "Reported clear (unverified)";
+                        }
+
+                        if (
+                            status ===
+                            "STALE"
+                            || p.is_stale
+                        ) {
+                            color =
+                                "#ea580c";
+                            displayStatus =
+                                "Stale - verify before crossing";
+                        }
+
                         const depth =
                             p.depth_cm != null
                                 ? `${p.depth_cm} cm`
@@ -1320,7 +1466,7 @@
                                         style="color:${color}"
                                     >
                                         ${escapeHtml(
-                                            status
+                                            displayStatus
                                         )}
                                     </div>
 
