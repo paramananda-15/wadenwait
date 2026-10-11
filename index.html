@@ -174,6 +174,40 @@
         .orange { background: #ea580c; }
         .gray { background: #777; }
 
+        .report-pin {
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            border: 2px solid #ffffff;
+            cursor: pointer;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.6);
+            transition: transform 0.2s ease, background-color 0.3s ease;
+        }
+        .report-pin:hover {
+            transform: scale(1.3);
+        }
+        .pin-pulse {
+            animation: pinPulse 1.2s ease-out 3;
+        }
+        @keyframes pinPulse {
+            0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.8); }
+            50% { transform: scale(1.4); box-shadow: 0 0 0 12px rgba(239, 68, 68, 0); }
+            100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+        }
+        @keyframes liveDotPulse {
+            0% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.3; transform: scale(0.8); }
+            100% { opacity: 1; transform: scale(1); }
+        }
+        .live-dot {
+            display: inline-block;
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: #22c55e;
+            animation: liveDotPulse 2s infinite ease-in-out;
+        }
+
         .analysis-panel {
             position: fixed;
             bottom: 18px;
@@ -347,9 +381,17 @@
         </div>
     </div>
 
+    <div id="toastContainer" style="position:fixed; top:20px; left:50%; transform:translateX(-50%); z-index:9999; display:flex; flex-direction:column; gap:8px; pointer-events:none;"></div>
+
     <div class="status-panel">
-        <div class="section-title">
-            Road status
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+            <div class="section-title" style="margin:0;">
+                Road status
+            </div>
+            <div id="liveIndicator" style="font-size:10px; color:#22c55e; display:flex; align-items:center; gap:5px; background:rgba(34,197,94,0.1); padding:2px 8px; border-radius:12px; border:1px solid rgba(34,197,94,0.25);">
+                <span class="live-dot"></span>
+                <span id="liveText">Live - updated 0s ago</span>
+            </div>
         </div>
 
         <div class="status-row">
@@ -550,8 +592,47 @@
 
         let selectedVehicle = "hatchback";
         let currentAnalysisResult = null;
+        let currentRoadGeoJSON = null;
+        let lastLoadedCenter = null;
+        let lastServerTime = 0;
+        let secondsSinceUpdate = 0;
+        let secondsTimer = null;
+        let pollTimer = null;
+        let pollIntervalMs = 15000;
+        const BASE_POLL_INTERVAL_MS = 15000;
+        const MAX_POLL_INTERVAL_MS = 120000;
+        const reportMarkers = {};
         let userPosition = null;
         let roadRequestTimer = null;
+
+        function showToast(msg) {
+            const container = document.getElementById("toastContainer");
+            if (!container) return;
+            const toast = document.createElement("div");
+            toast.textContent = msg;
+            toast.style.cssText = "background:rgba(20,20,20,0.95); border:1px solid rgba(255,255,255,0.2); color:#fff; padding:8px 16px; border-radius:8px; font-size:12px; font-weight:600; box-shadow:0 4px 12px rgba(0,0,0,0.5); opacity:0; transition:opacity 0.3s ease; pointer-events:auto;";
+            container.appendChild(toast);
+            requestAnimationFrame(() => toast.style.opacity = "1");
+            setTimeout(() => {
+                toast.style.opacity = "0";
+                setTimeout(() => toast.remove(), 400);
+            }, 4000);
+        }
+
+        function updateLiveTimerText() {
+            const el = document.getElementById("liveText");
+            if (el) {
+                el.textContent = `Live - updated ${secondsSinceUpdate}s ago`;
+            }
+        }
+
+        function startSecondsCounter() {
+            if (secondsTimer) clearInterval(secondsTimer);
+            secondsTimer = setInterval(() => {
+                secondsSinceUpdate++;
+                updateLiveTimerText();
+            }, 1000);
+        }
 
         const map = new maplibregl.Map({
             container: "map",
@@ -856,6 +937,15 @@
                     data.counts || {}
                 );
 
+                currentRoadGeoJSON = data;
+                lastLoadedCenter = map.getCenter();
+                if (data.server_time || data.generated_at) {
+                    lastServerTime = data.server_time || data.generated_at;
+                }
+                secondsSinceUpdate = 0;
+                updateLiveTimerText();
+                startPolling();
+
                 const featureCount =
                     (
                         data.features || []
@@ -878,6 +968,168 @@
                 );
             }
         }
+
+        function getMarkerColor(status) {
+            if (status === "PASSABLE") return "#22c55e";
+            if (status === "CAUTION") return "#facc15";
+            if (status === "FLOODED") return "#ef4444";
+            if (status === "BLOCKED") return "#7f1d1d";
+            if (status === "REPORTED_CLEAR") return "#0284c7";
+            if (status === "STALE") return "#ea580c";
+            return "#777777";
+        }
+
+        function updatePinMarker(change) {
+            if (!change.report_id) return;
+
+            if (change.change_type === "cleared") {
+                if (reportMarkers[change.report_id]) {
+                    reportMarkers[change.report_id].remove();
+                    delete reportMarkers[change.report_id];
+                }
+                return;
+            }
+
+            const color = getMarkerColor(change.status);
+
+            if (reportMarkers[change.report_id]) {
+                const marker = reportMarkers[change.report_id];
+                const el = marker.getElement();
+                if (el) el.style.backgroundColor = color;
+            } else {
+                const el = document.createElement("div");
+                el.className = "report-pin" + (change.change_type === "new" ? " pin-pulse" : "");
+                el.style.backgroundColor = color;
+
+                const popupHtml = `
+                    <div style="font-size:12px; font-weight:bold; color:${color};">${escapeHtml(change.label || change.status)}</div>
+                    <div style="font-size:11px; color:#aaa; margin-top:2px;">Depth: ${escapeHtml(change.depth_band || "unknown")}</div>
+                    <div style="margin-top:6px; display:flex; gap:6px;">
+                        <button onclick="voteReport('${change.report_id}','still_flooded')" style="font-size:10px; padding:3px 6px; background:#ef4444; color:#fff; border:none; border-radius:4px; cursor:pointer;">Still flooded</button>
+                        <button onclick="voteReport('${change.report_id}','cleared')" style="font-size:10px; padding:3px 6px; background:#22c55e; color:#fff; border:none; border-radius:4px; cursor:pointer;">It's clear</button>
+                    </div>
+                    <div id="voteMsg_${change.report_id}" style="font-size:10px; color:#aaa; margin-top:4px;"></div>
+                `;
+                const popup = new maplibregl.Popup({ offset: 12 }).setHTML(popupHtml);
+
+                const marker = new maplibregl.Marker({ element: el })
+                    .setLngLat([change.lng, change.lat])
+                    .setPopup(popup)
+                    .addTo(map);
+
+                reportMarkers[change.report_id] = marker;
+
+                if (change.change_type === "new") {
+                    setTimeout(() => {
+                        el.classList.remove("pin-pulse");
+                    }, 3600);
+                }
+            }
+        }
+
+        function applyMapChanges(changes) {
+            if (!changes || !changes.length) return;
+
+            let updatedRoads = false;
+
+            for (const change of changes) {
+                if (change.change_type === "new") {
+                    showToast(`New flood report in view: ${change.label || change.status}`);
+                }
+
+                if (change.road_id && currentRoadGeoJSON && currentRoadGeoJSON.features) {
+                    const feat = currentRoadGeoJSON.features.find(f => f.properties && f.properties.road_id === change.road_id);
+                    if (feat) {
+                        feat.properties.status = change.status;
+                        feat.properties.status_label = change.label;
+                        feat.properties.opacity = change.opacity;
+                        feat.properties.last_verified = change.last_verified;
+                        feat.properties.report_id = change.report_id;
+                        updatedRoads = true;
+                    }
+                }
+
+                updatePinMarker(change);
+            }
+
+            if (updatedRoads) {
+                const source = map.getSource("flood-roads");
+                if (source) {
+                    source.setData(currentRoadGeoJSON);
+                }
+                const counts = { PASSABLE: 0, CAUTION: 0, FLOODED: 0, BLOCKED: 0, UNKNOWN: 0, REPORTED_CLEAR: 0, STALE: 0 };
+                for (const f of currentRoadGeoJSON.features) {
+                    const st = f.properties.status || "UNKNOWN";
+                    counts[st] = (counts[st] || 0) + 1;
+                }
+                updateCounts(counts);
+            }
+        }
+
+        async function pollUpdates() {
+            if (!map.loaded() || document.hidden || !navigator.onLine) {
+                return;
+            }
+            try {
+                const bbox = currentBbox();
+                const url = `${API}/map/updates?bbox=${encodeURIComponent(bbox)}&since=${lastServerTime}&mode=${encodeURIComponent(selectedVehicle)}`;
+                const res = await fetch(url);
+                if (!res.ok) {
+                    throw new Error(`Poll failed: ${res.status}`);
+                }
+                const data = await res.json();
+                if (data.server_time) {
+                    lastServerTime = data.server_time;
+                }
+                secondsSinceUpdate = 0;
+                updateLiveTimerText();
+                pollIntervalMs = BASE_POLL_INTERVAL_MS;
+
+                if (data.changes && data.changes.length > 0) {
+                    applyMapChanges(data.changes);
+                }
+            } catch (err) {
+                console.warn("Poll updates error, backing off:", err);
+                pollIntervalMs = Math.min(MAX_POLL_INTERVAL_MS, pollIntervalMs * 2);
+            } finally {
+                if (!document.hidden && navigator.onLine) {
+                    pollTimer = setTimeout(pollUpdates, pollIntervalMs);
+                }
+            }
+        }
+
+        function startPolling() {
+            stopPolling();
+            pollIntervalMs = BASE_POLL_INTERVAL_MS;
+            pollTimer = setTimeout(pollUpdates, pollIntervalMs);
+            startSecondsCounter();
+        }
+
+        function stopPolling() {
+            if (pollTimer) {
+                clearTimeout(pollTimer);
+                pollTimer = null;
+            }
+        }
+
+        document.addEventListener("visibilitychange", () => {
+            if (document.hidden) {
+                stopPolling();
+            } else {
+                pollUpdates();
+                startPolling();
+            }
+        });
+
+        window.addEventListener("online", () => {
+            pollIntervalMs = BASE_POLL_INTERVAL_MS;
+            loadRoads();
+            startPolling();
+        });
+
+        window.addEventListener("offline", () => {
+            stopPolling();
+        });
 
         function updateCounts(counts) {
             document.getElementById(
@@ -912,6 +1164,17 @@
                 counts.UNKNOWN || 0;
         }
 
+        function haversineDistM(lat1, lon1, lat2, lon2) {
+            const R = 6371000;
+            const dLat = (lat2 - lat1) * Math.PI / 180;
+            const dLon = (lon2 - lon1) * Math.PI / 180;
+            const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                      Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                      Math.sin(dLon/2) * Math.sin(dLon/2);
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+            return R * c;
+        }
+
         function scheduleRoadRefresh() {
             clearTimeout(
                 roadRequestTimer
@@ -924,9 +1187,22 @@
                 );
         }
 
+        function handleMapMoveEnd() {
+            if (!lastLoadedCenter) {
+                scheduleRoadRefresh();
+                return;
+            }
+            const cur = map.getCenter();
+            const dist = haversineDistM(lastLoadedCenter.lat, lastLoadedCenter.lng, cur.lat, cur.lng);
+            // Full refresh on large pan (> 800 meters)
+            if (dist > 800) {
+                scheduleRoadRefresh();
+            }
+        }
+
         map.on(
             "moveend",
-            scheduleRoadRefresh
+            handleMapMoveEnd
         );
 
         function vehicleLabel(mode) {

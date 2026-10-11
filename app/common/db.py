@@ -50,11 +50,12 @@ def init():
                 image_usable INTEGER,
                 created_at INTEGER,
                 last_verified INTEGER,
-                cleared INTEGER DEFAULT 0
+                cleared INTEGER DEFAULT 0,
+                updated_at INTEGER
             )
         """)
 
-        # Migration: ensure last_verified and cleared exist without touching existing data
+        # Migration: ensure last_verified, cleared, and updated_at exist without touching existing data
         cursor = c.execute("PRAGMA table_info(reports)")
         columns = [row["name"] for row in cursor.fetchall()]
 
@@ -65,10 +66,20 @@ def init():
         if "cleared" not in columns:
             c.execute("ALTER TABLE reports ADD COLUMN cleared INTEGER DEFAULT 0")
 
+        if "updated_at" not in columns:
+            c.execute("ALTER TABLE reports ADD COLUMN updated_at INTEGER")
+            c.execute("UPDATE reports SET updated_at = coalesce(last_verified, created_at, 0) WHERE updated_at IS NULL")
+
         c.execute("""
             CREATE INDEX IF NOT EXISTS
             idx_reports_geo
             ON reports(lat, lng)
+        """)
+
+        c.execute("""
+            CREATE INDEX IF NOT EXISTS
+            idx_reports_updated
+            ON reports(updated_at)
         """)
 
         # New votes table behind existing interface
@@ -114,13 +125,14 @@ def insert(r: Dict[str, Any]) -> str:
                 image_usable,
                 created_at,
                 last_verified,
-                cleared
+                cleared,
+                updated_at
             )
             VALUES (
                 ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?,
-                ?, ?
+                ?, ?, ?
             )
             """,
             (
@@ -141,6 +153,7 @@ def insert(r: Dict[str, Any]) -> str:
                 now,
                 last_verified,
                 0,
+                now,
             )
         )
 
@@ -215,8 +228,8 @@ def add_vote(report_id: str, device_id: str, vote: str) -> Dict[str, Any]:
 
         if vote == "still_flooded":
             c.execute(
-                "UPDATE reports SET last_verified = ?, cleared = 0 WHERE id = ?",
-                (now, report_id),
+                "UPDATE reports SET last_verified = ?, updated_at = ?, cleared = 0 WHERE id = ?",
+                (now, now, report_id),
             )
             is_cleared = False
             last_verified = now
@@ -235,16 +248,16 @@ def add_vote(report_id: str, device_id: str, vote: str) -> Dict[str, Any]:
             # Must not override photo report newer than 10 minutes (configurable constant)
             if cleared_cnt >= 2 and not is_photo_protected:
                 c.execute(
-                    "UPDATE reports SET cleared = 1, last_verified = ? WHERE id = ?",
-                    (now, report_id),
+                    "UPDATE reports SET cleared = 1, last_verified = ?, updated_at = ? WHERE id = ?",
+                    (now, now, report_id),
                 )
                 is_cleared = True
                 last_verified = now
             else:
                 # Vote is counted in report_votes, but photo is recent: keep road marked flooded
                 c.execute(
-                    "UPDATE reports SET last_verified = ? WHERE id = ?",
-                    (now, report_id),
+                    "UPDATE reports SET last_verified = ?, updated_at = ? WHERE id = ?",
+                    (now, now, report_id),
                 )
                 is_cleared = bool(rep["cleared"]) and not is_photo_protected
                 last_verified = now
@@ -295,3 +308,63 @@ def nearby(bbox, include_cleared: bool = False) -> List[sqlite3.Row]:
         ).fetchall()
 
     return rows
+
+
+def refresh_stale_reports(now: Optional[int] = None) -> int:
+    """
+    Checks active reports whose age since last_verified has crossed the stale threshold.
+    Updates their updated_at to the transition timestamp (last_verified + stale_threshold)
+    so polling queries pick up the stale transition.
+    """
+    now_ts = now if now is not None else int(time.time())
+    stale_sec = int(os.getenv("STALE_THRESHOLD_SECONDS", 3600))
+    with conn() as c:
+        cursor = c.execute(
+            """
+            UPDATE reports
+            SET updated_at = last_verified + ?
+            WHERE (cleared IS NULL OR cleared = 0)
+              AND last_verified IS NOT NULL
+              AND (last_verified + ?) <= ?
+              AND (updated_at IS NULL OR updated_at < last_verified + ?)
+            """,
+            (stale_sec, stale_sec, now_ts, stale_sec),
+        )
+        return cursor.rowcount
+
+
+def changed_since(bbox, since_ts: int) -> List[Dict[str, Any]]:
+    """
+    Returns reports created, confirmed, cleared, or transitioned to stale after since_ts inside the bbox.
+    Uses one updated_at value per report for clean polling.
+    Keep signature simple so a DynamoDB version can be added later.
+    """
+    if isinstance(bbox, str):
+        parts = [float(x.strip()) for x in bbox.split(",")]
+        west, south, east, north = parts[0], parts[1], parts[2], parts[3]
+    else:
+        west, south, east, north = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+
+    refresh_stale_reports()
+
+    with conn() as c:
+        query = """
+            SELECT *
+            FROM reports
+            WHERE lng BETWEEN ? AND ?
+              AND lat BETWEEN ? AND ?
+              AND updated_at > ?
+            ORDER BY updated_at ASC
+            LIMIT 500
+        """
+        rows = c.execute(
+            query,
+            (
+                min(west, east),
+                max(west, east),
+                min(south, north),
+                max(south, north),
+                int(since_ts or 0),
+            ),
+        ).fetchall()
+        return [dict(row) for row in rows]

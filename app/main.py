@@ -1480,6 +1480,137 @@ def map_pins(
     }
 
 
+@app.get("/map/updates")
+def map_updates(
+    bbox: str,
+    since: Optional[int] = 0,
+    mode: Optional[str] = "hatchback",
+):
+    try:
+        west, south, east, north = map(
+            float,
+            bbox.split(","),
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "bbox must be "
+                "west,south,east,north"
+            ),
+        )
+
+    server_time = int(time.time())
+    since_ts = int(since or 0)
+    stale_threshold_sec = int(os.getenv("STALE_THRESHOLD_SECONDS", 3600))
+    selected_mode = mode if mode in MODES else "hatchback"
+
+    rows = db.changed_since(
+        (west, south, east, north),
+        since_ts,
+    )
+
+    try:
+        roads_list = fetch_osm_roads(
+            west,
+            south,
+            east,
+            north,
+        )
+    except Exception:
+        roads_list = []
+
+    changes = []
+    MAX_CHANGES = 100
+
+    for row in rows[:MAX_CHANGES]:
+        matched_road_id = None
+        best_dist = float("inf")
+        rep_dict = {
+            "lat": float(row["lat"]),
+            "lng": float(row["lng"]),
+        }
+
+        for r in roads_list:
+            dist = road_report_distance(
+                r.get("geometry", []),
+                rep_dict,
+            )
+            if dist <= REPORT_MATCH_RADIUS_M and dist < best_dist:
+                best_dist = dist
+                matched_road_id = r.get("id")
+
+        last_verified_ts = (
+            row.get("last_verified")
+            or row.get("created_at")
+            or row.get("updated_at")
+            or server_time
+        )
+        age_sec = max(0, server_time - last_verified_ts)
+        is_stale = age_sec >= stale_threshold_sec
+        fade = max(0.35, min(1.0, 1.0 - (age_sec / (180.0 * 60.0)) * 0.65))
+
+        is_cleared = bool(row.get("cleared"))
+
+        if is_cleared:
+            status = "REPORTED_CLEAR"
+            label = "Reported clear (unverified)"
+            opacity = 0.9
+            change_type = "cleared"
+        elif is_stale:
+            status = "STALE"
+            label = "Stale - verify before crossing"
+            opacity = round(fade, 2)
+            created_ts = row.get("created_at") or 0
+            change_type = "new" if created_ts > since_ts else "updated"
+        else:
+            depth_hi = float(row.get("depth_hi", 0) or 0)
+            depth_lo = float(row.get("depth_lo", 0) or 0)
+            if row.get("image_usable") and (depth_hi > 0 or float(row.get("confidence", 0) or 0) > 0):
+                depth = (depth_lo + depth_hi) / 2.0
+                status = classify_road(depth, selected_mode)
+                label = status.capitalize()
+            else:
+                status = "UNKNOWN"
+                label = "Unknown"
+            opacity = round(fade, 2)
+            created_ts = row.get("created_at") or 0
+            change_type = "new" if created_ts > since_ts else "updated"
+
+        raw_verdicts = row.get("verdicts")
+        if isinstance(raw_verdicts, str):
+            try:
+                verdicts = json.loads(raw_verdicts)
+            except Exception:
+                verdicts = {}
+        elif isinstance(raw_verdicts, dict):
+            verdicts = raw_verdicts
+        else:
+            verdicts = {}
+
+        band_val = row.get("band") or "unknown"
+
+        changes.append({
+            "report_id": row.get("id"),
+            "road_id": matched_road_id,
+            "status": status,
+            "label": label,
+            "opacity": opacity,
+            "lat": float(row["lat"]),
+            "lng": float(row["lng"]),
+            "depth_band": band_val,
+            "band": band_val,
+            "verdicts": verdicts,
+            "last_verified": last_verified_ts,
+            "change_type": change_type,
+        })
+
+    return {
+        "server_time": server_time,
+        "changes": changes,
+    }
+
+
 @app.get("/weather")
 def weather(
     lat: float,
