@@ -1,22 +1,21 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Transform: AWS::Serverless-2016-10-31
 Description: >
   Wade or Wait - Infrastructure as Code for Free-Tier/Low-Cost AWS Deployment.
-  Architecture: App Runner (single container, min 1 / max 2), DynamoDB (on-demand, TTL),
+  Architecture: EC2 (t3.micro Free-Tier single container), DynamoDB (on-demand, TTL),
   S3 (private, 14-day lifecycle, CORS enabled), OpenAI-compatible Vision API, CloudWatch Logs (7-day retention).
 
 Parameters:
   ImageUri:
     Type: String
-    Description: URI of the container image in Amazon ECR (e.g. 123456789012.dkr.ecr.ap-southeast-2.amazonaws.com/wade-or-wait:latest)
+    Description: URI of the container image in Amazon ECR (e.g. 123456789012.dkr.ecr.ap-southeast-2.amazonaws.com/wadenwait-prod:latest)
 
   VisionApiBaseUrl:
     Type: String
-    Description: Base URL for OpenAI-compatible vision chat completions API (e.g. https://api.openai.com/v1)
+    Description: Base URL for OpenAI-compatible vision chat completions API (e.g. https://api.groq.com/openai/v1)
 
   VisionModel:
     Type: String
-    Description: Vision model identifier (e.g. gpt-4o-mini)
+    Description: Vision model identifier (e.g. qwen/qwen3.8-27b)
 
   VisionApiKey:
     Type: String
@@ -33,17 +32,27 @@ Parameters:
     Default: ""
     Description: Optional email address to receive AWS Budget alerts at $10, $25, and $50
 
+  InstanceType:
+    Type: String
+    Default: "t3.micro"
+    AllowedValues: ["t3.micro", "t3.small", "t2.micro", "t2.small"]
+    Description: EC2 instance type (t3.micro is AWS Free Tier eligible)
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 AMI ID retrieved from SSM Parameter Store
+
+  # Retained for backwards compatibility with deploy parameter passing
   AppRunnerCpu:
     Type: String
     Default: "0.25 vCPU"
-    AllowedValues: ["0.25 vCPU", "0.5 vCPU", "1 vCPU", "2 vCPU"]
-    Description: CPU allocation for the App Runner container instance
+    Description: Unused - retained for parameter compatibility
 
   AppRunnerMemory:
     Type: String
     Default: "0.5 GB"
-    AllowedValues: ["0.5 GB", "1 GB", "2 GB", "3 GB", "4 GB"]
-    Description: Memory allocation for the App Runner container instance
+    Description: Unused - retained for parameter compatibility
 
 Conditions:
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
@@ -169,16 +178,16 @@ Resources:
   # -------------------------------------------------------------------
   # CloudWatch Logs (7-Day Retention)
   # -------------------------------------------------------------------
-  AppRunnerLogGroup:
+  AppLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub "/aws/apprunner/${AWS::StackName}-service"
+      LogGroupName: !Sub "/aws/ec2/${AWS::StackName}-service"
       RetentionInDays: 7
 
   # -------------------------------------------------------------------
-  # IAM Roles (Least Privilege)
+  # IAM Roles (Least Privilege for EC2 Instance)
   # -------------------------------------------------------------------
-  AppRunnerECRAccessRole:
+  AppInstanceRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -186,23 +195,12 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              Service: build.apprunner.amazonaws.com
+              Service: ec2.amazonaws.com
             Action: sts:AssumeRole
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess
-
-  AppRunnerInstanceRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: tasks.apprunner.amazonaws.com
-            Action: sts:AssumeRole
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
       Policies:
-        - PolicyName: AppRunnerLeastPrivilegePolicy
+        - PolicyName: AppInstanceLeastPrivilegePolicy
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
@@ -239,59 +237,83 @@ Resources:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                   - logs:DescribeLogStreams
-                Resource: !Sub "${AppRunnerLogGroup.Arn}:*"
+                Resource: !Sub "${AppLogGroup.Arn}:*"
+
+  AppInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+        - !Ref AppInstanceRole
 
   # -------------------------------------------------------------------
-  # App Runner Service (Auto-Scaled, min 1 / max 2)
+  # EC2 Security Group (HTTP Port 80 and Port 8000)
   # -------------------------------------------------------------------
-  AppRunnerService:
-    Type: AWS::AppRunner::Service
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
     Properties:
-      ServiceName: !Sub "${AWS::StackName}-service"
-      SourceConfiguration:
-        AuthenticationConfiguration:
-          AccessRoleArn: !GetAtt AppRunnerECRAccessRole.Arn
-        ImageRepository:
-          ImageIdentifier: !Ref ImageUri
-          ImageRepositoryType: ECR
-          ImageConfiguration:
-            Port: "8000"
-            RuntimeEnvironmentVariables:
-              - Name: DB_BACKEND
-                Value: "dynamodb"
-              - Name: STORAGE_BACKEND
-                Value: "s3"
-              - Name: S3_BUCKET
-                Value: !Ref PhotoBucket
-              - Name: REPORTS_TABLE
-                Value: !Ref ReportsTable
-              - Name: VOTES_TABLE
-                Value: !Ref VotesTable
-              - Name: CLEAR_TIME_LOG_TABLE
-                Value: !Ref ClearTimeLogTable
-              - Name: LLM_PROVIDER
-                Value: "openai_compat"
-              - Name: PERCEPTION_MODE
-                Value: "vlm"
-              - Name: VISION_API_BASE_URL
-                Value: !Ref VisionApiBaseUrl
-              - Name: VISION_MODEL
-                Value: !Ref VisionModel
-              - Name: VISION_API_KEY
-                Value: !Ref VisionApiKey
-              - Name: DAILY_ANALYSIS_CAP
-                Value: !Sub "${DailyAnalysisCap}"
-      InstanceConfiguration:
-        InstanceRoleArn: !GetAtt AppRunnerInstanceRole.Arn
-        Cpu: !Ref AppRunnerCpu
-        Memory: !Ref AppRunnerMemory
-      HealthCheckConfiguration:
-        Protocol: HTTP
-        Path: /health
-        Interval: 10
-        Timeout: 5
-        HealthyThreshold: 1
-        UnhealthyThreshold: 3
+      GroupDescription: Enable HTTP access for Wade or Wait container
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          CidrIp: 0.0.0.0/0
+
+  # -------------------------------------------------------------------
+  # EC2 Instance (Free-Tier t3.micro running container on startup)
+  # -------------------------------------------------------------------
+  AppInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      IamInstanceProfile: !Ref AppInstanceProfile
+      SecurityGroupIds:
+        - !Ref AppSecurityGroup
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpPutResponseHopLimit: 2
+        HttpTokens: optional
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-instance"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          echo "Starting initialization at $(date)"
+          dnf update -y
+          dnf install -y docker
+          systemctl enable --now docker
+
+          # Login to ECR
+          aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com
+
+          # Run Wade or Wait container
+          docker pull ${ImageUri}
+          docker run -d --restart always \
+            -p 80:8000 \
+            -p 8000:8000 \
+            -e DB_BACKEND=dynamodb \
+            -e STORAGE_BACKEND=s3 \
+            -e S3_BUCKET=${PhotoBucket} \
+            -e REPORTS_TABLE=${ReportsTable} \
+            -e VOTES_TABLE=${VotesTable} \
+            -e CLEAR_TIME_LOG_TABLE=${ClearTimeLogTable} \
+            -e LLM_PROVIDER=openai_compat \
+            -e PERCEPTION_MODE=vlm \
+            -e VISION_API_BASE_URL="${VisionApiBaseUrl}" \
+            -e VISION_MODEL="${VisionModel}" \
+            -e VISION_API_KEY="${VisionApiKey}" \
+            -e DAILY_ANALYSIS_CAP="${DailyAnalysisCap}" \
+            -e AWS_DEFAULT_REGION=${AWS::Region} \
+            ${ImageUri}
+
+          echo "Initialization finished at $(date)"
 
   # -------------------------------------------------------------------
   # AWS Budgets Alerts ($10, $25, $50)
@@ -361,12 +383,16 @@ Resources:
 
 Outputs:
   ServiceUrl:
-    Description: HTTPS URL of the App Runner application service
-    Value: !Sub "https://${AppRunnerService.ServiceUrl}"
+    Description: HTTP URL of the Wade or Wait application
+    Value: !Sub "http://${AppInstance.PublicIp}"
 
-  ServiceId:
-    Description: App Runner Service ID
-    Value: !GetAtt AppRunnerService.ServiceId
+  InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref AppInstance
+
+  PublicIp:
+    Description: EC2 Instance Public IP
+    Value: !GetAtt AppInstance.PublicIp
 
   ReportsTableName:
     Description: DynamoDB Reports table name

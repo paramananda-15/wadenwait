@@ -112,9 +112,19 @@ SERVICE_URL=$(aws cloudformation describe-stacks \
     --output text 2>/dev/null || true)
 
 if [ -n "$SERVICE_URL" ] && [ "$SERVICE_URL" != "None" ]; then
+    echo -e "\nWaiting for application container to initialize (usually 30-45s)..."
+    for i in {1..24}; do
+        if curl -sf --connect-timeout 3 "$SERVICE_URL/health" >/dev/null 2>&1; then
+            echo "Service is healthy and responding!"
+            break
+        fi
+        sleep 5
+    done
+
     echo ""
     echo "================================================================="
     echo "SUCCESS! Wade or Wait is live at: $SERVICE_URL"
     echo "Test health endpoint: $SERVICE_URL/health"
     echo "================================================================="
 fi
+
