@@ -1,0 +1,17 @@
+data/
+eval/
+outputs/
+.git/
+.github/
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.env.*
+tests/
+scripts/
+docs/
+*.md

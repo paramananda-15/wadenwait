@@ -666,6 +666,14 @@
             "bottom-right"
         );
 
+        map.addControl(
+            new maplibregl.AttributionControl({
+                compact: false,
+                customAttribution: "© OpenStreetMap contributors"
+            }),
+            "bottom-left"
+        );
+
         function setMessage(text) {
             document.getElementById(
                 "message"

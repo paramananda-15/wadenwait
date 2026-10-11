@@ -38,6 +38,7 @@ from .common import (
     detector,
     fusion,
     clear_time,
+    storage,
 )
 from .common.rate_limit import check_rate_limit
 
@@ -891,6 +892,11 @@ def build_road_features(
 # Core API
 # -------------------------------------------------------------------
 
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "healthy": True}
+
+
 @app.get("/api/health")
 def health():
     return {
@@ -907,20 +913,20 @@ def health():
             ),
         "map_mode":
             "road-flood",
+        "storage_backend":
+            storage.get_backend(),
+        "db_backend":
+            "dynamodb" if db.is_dynamo() else "sqlite",
     }
 
 
 @app.post("/upload-url")
 def upload_url():
-    key = (
-        "photos/"
-        + uuid.uuid4().hex
-        + ".jpg"
-    )
+    key = storage.generate_object_key("photos", "jpg")
 
     return {
         "url":
-            "/upload",
+            storage.get_upload_url(key),
 
         "key":
             key,
@@ -965,19 +971,11 @@ async def upload(
         )
 
     filename = Path(key).name
-    path = UPLOADS / filename
-
-    path.write_bytes(data)
-
-    if not path.exists():
-        raise HTTPException(
-            status_code=500,
-            detail="photo was not saved",
-        )
+    saved_key = storage.save_file(key, data, content_type="image/jpeg")
 
     return {
         "ok": True,
-        "key": key,
+        "key": saved_key,
         "filename": filename,
         "size": len(data),
     }
@@ -986,21 +984,17 @@ async def upload(
 @app.post("/reports")
 def report(req: ReportRequest):
     filename = Path(req.key).name
-    path = UPLOADS / filename
+    try:
+        image = storage.get_file(req.key)
+    except FileNotFoundError:
+        try:
+            image = storage.get_file(f"photos/{filename}")
+        except FileNotFoundError:
+            raise HTTPException(
+                status_code=404,
+                detail="photo not found",
+            )
 
-    print()
-    print("========== REPORT ==========")
-    print("Requested key :", req.key)
-    print("Looking for   :", path)
-    print("Exists        :", path.exists())
-
-    if not path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail="photo not found",
-        )
-
-    image = path.read_bytes()
     mode_env = os.getenv("PERCEPTION_MODE", "fusion").strip().lower()
 
     if mode_env == "fusion":
@@ -1036,13 +1030,18 @@ def report(req: ReportRequest):
         )
 
         exp_filename = f"explanation_{filename}"
+        exp_key = f"photos/{exp_filename}"
         exp_path = UPLOADS / exp_filename
         _, reason = detector.create_explanation_image(
             image,
             det_est,
             save_path=exp_path,
         )
-        explanation_url = f"/uploads/{exp_filename}"
+        if storage.get_backend() == "s3" and exp_path.exists():
+            storage.save_file(exp_key, exp_path.read_bytes(), content_type="image/jpeg")
+            explanation_url = storage.get_url(exp_key)
+        else:
+            explanation_url = f"/uploads/{exp_filename}"
 
         has_depth = fused["fused_interval"] is not None
         depth_cm = fused["fused_interval"] if has_depth else [0, 0]
@@ -1103,13 +1102,18 @@ def report(req: ReportRequest):
                     flow=obs.get("flow", "still"),
                 )
                 exp_filename = f"explanation_{filename}"
+                exp_key = f"photos/{exp_filename}"
                 exp_path = UPLOADS / exp_filename
                 _, reason = detector.create_explanation_image(
                     image,
                     det_est,
                     save_path=exp_path,
                 )
-                explanation_url = f"/uploads/{exp_filename}"
+                if storage.get_backend() == "s3" and exp_path.exists():
+                    storage.save_file(exp_key, exp_path.read_bytes(), content_type="image/jpeg")
+                    explanation_url = storage.get_url(exp_key)
+                else:
+                    explanation_url = f"/uploads/{exp_filename}"
                 depth_cm = fused["fused_interval"]
                 band = geometry.band((depth_cm[0] + depth_cm[1]) / 2)
                 result = {
@@ -2079,13 +2083,14 @@ app.mount(
     name="static",
 )
 
-app.mount(
-    "/uploads",
-    StaticFiles(
-        directory=UPLOADS,
-    ),
-    name="uploads",
-)
+if storage.get_backend() != "s3":
+    app.mount(
+        "/uploads",
+        StaticFiles(
+            directory=UPLOADS,
+        ),
+        name="uploads",
+    )
 
 
 @app.get("/")

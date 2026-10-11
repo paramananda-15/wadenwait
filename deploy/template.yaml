@@ -1,0 +1,385 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Wade or Wait - Infrastructure as Code for Free-Tier/Low-Cost AWS Deployment.
+  Architecture: App Runner (single container, min 1 / max 2), DynamoDB (on-demand, TTL),
+  S3 (private, 14-day lifecycle, CORS enabled), OpenAI-compatible Vision API, CloudWatch Logs (7-day retention).
+
+Parameters:
+  ImageUri:
+    Type: String
+    Description: URI of the container image in Amazon ECR (e.g. 123456789012.dkr.ecr.ap-southeast-2.amazonaws.com/wade-or-wait:latest)
+
+  VisionApiBaseUrl:
+    Type: String
+    Description: Base URL for OpenAI-compatible vision chat completions API (e.g. https://api.openai.com/v1)
+
+  VisionModel:
+    Type: String
+    Description: Vision model identifier (e.g. gpt-4o-mini)
+
+  VisionApiKey:
+    Type: String
+    NoEcho: true
+    Description: Secret API key for OpenAI-compatible vision API
+
+  DailyAnalysisCap:
+    Type: Number
+    Default: 100
+    Description: Global atomic daily cap on vision analysis model calls
+
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Optional email address to receive AWS Budget alerts at $10, $25, and $50
+
+  AppRunnerCpu:
+    Type: String
+    Default: "0.25 vCPU"
+    AllowedValues: ["0.25 vCPU", "0.5 vCPU", "1 vCPU", "2 vCPU"]
+    Description: CPU allocation for the App Runner container instance
+
+  AppRunnerMemory:
+    Type: String
+    Default: "0.5 GB"
+    AllowedValues: ["0.5 GB", "1 GB", "2 GB", "3 GB", "4 GB"]
+    Description: Memory allocation for the App Runner container instance
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Resources:
+  # -------------------------------------------------------------------
+  # S3 Storage (Private, Block Public Access, CORS enabled, 14-day Lifecycle)
+  # -------------------------------------------------------------------
+  PhotoBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - "*"
+            AllowedMethods:
+              - GET
+              - PUT
+              - HEAD
+            AllowedOrigins:
+              - "*"
+            MaxAge: 3600
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAfter14Days
+            Status: Enabled
+            ExpirationInDays: 14
+
+  # -------------------------------------------------------------------
+  # DynamoDB Tables (On-Demand Pay-Per-Request, TTL Enabled)
+  # -------------------------------------------------------------------
+  ReportsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: cell
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: cell
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: IdIndex
+          KeySchema:
+            - AttributeName: id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  VotesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: report_id
+          AttributeType: S
+        - AttributeName: device_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: report_id
+          KeyType: HASH
+        - AttributeName: device_id
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  ClearTimeLogTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: road_id
+          AttributeType: S
+        - AttributeName: cell_key
+          AttributeType: S
+        - AttributeName: issued_at
+          AttributeType: N
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: RoadIndex
+          KeySchema:
+            - AttributeName: road_id
+              KeyType: HASH
+            - AttributeName: issued_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: CellIndex
+          KeySchema:
+            - AttributeName: cell_key
+              KeyType: HASH
+            - AttributeName: issued_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  # -------------------------------------------------------------------
+  # CloudWatch Logs (7-Day Retention)
+  # -------------------------------------------------------------------
+  AppRunnerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apprunner/${AWS::StackName}-service"
+      RetentionInDays: 7
+
+  # -------------------------------------------------------------------
+  # IAM Roles (Least Privilege)
+  # -------------------------------------------------------------------
+  AppRunnerECRAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: build.apprunner.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess
+
+  AppRunnerInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: tasks.apprunner.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AppRunnerLeastPrivilegePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # S3 photo storage
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:HeadObject
+                Resource: !Sub "${PhotoBucket.Arn}/*"
+
+              # DynamoDB tables and indexes
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt ReportsTable.Arn
+                  - !Sub "${ReportsTable.Arn}/index/*"
+                  - !GetAtt VotesTable.Arn
+                  - !GetAtt ClearTimeLogTable.Arn
+                  - !Sub "${ClearTimeLogTable.Arn}/index/*"
+
+              # CloudWatch Logs
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub "${AppRunnerLogGroup.Arn}:*"
+
+  # -------------------------------------------------------------------
+  # App Runner Service (Auto-Scaled, min 1 / max 2)
+  # -------------------------------------------------------------------
+  AppRunnerService:
+    Type: AWS::AppRunner::Service
+    Properties:
+      ServiceName: !Sub "${AWS::StackName}-service"
+      SourceConfiguration:
+        AuthenticationConfiguration:
+          AccessRoleArn: !GetAtt AppRunnerECRAccessRole.Arn
+        ImageRepository:
+          ImageIdentifier: !Ref ImageUri
+          ImageRepositoryType: ECR
+          ImageConfiguration:
+            Port: "8000"
+            RuntimeEnvironmentVariables:
+              - Name: DB_BACKEND
+                Value: "dynamodb"
+              - Name: STORAGE_BACKEND
+                Value: "s3"
+              - Name: S3_BUCKET
+                Value: !Ref PhotoBucket
+              - Name: REPORTS_TABLE
+                Value: !Ref ReportsTable
+              - Name: VOTES_TABLE
+                Value: !Ref VotesTable
+              - Name: CLEAR_TIME_LOG_TABLE
+                Value: !Ref ClearTimeLogTable
+              - Name: LLM_PROVIDER
+                Value: "openai_compat"
+              - Name: PERCEPTION_MODE
+                Value: "vlm"
+              - Name: VISION_API_BASE_URL
+                Value: !Ref VisionApiBaseUrl
+              - Name: VISION_MODEL
+                Value: !Ref VisionModel
+              - Name: VISION_API_KEY
+                Value: !Ref VisionApiKey
+              - Name: DAILY_ANALYSIS_CAP
+                Value: !Sub "${DailyAnalysisCap}"
+      InstanceConfiguration:
+        InstanceRoleArn: !GetAtt AppRunnerInstanceRole.Arn
+        Cpu: !Ref AppRunnerCpu
+        Memory: !Ref AppRunnerMemory
+      HealthCheckConfiguration:
+        Protocol: HTTP
+        Path: /health
+        Interval: 10
+        Timeout: 5
+        HealthyThreshold: 1
+        UnhealthyThreshold: 3
+
+  # -------------------------------------------------------------------
+  # AWS Budgets Alerts ($10, $25, $50)
+  # -------------------------------------------------------------------
+  CostBudget10:
+    Type: AWS::Budgets::Budget
+    Condition: HasAlertEmail
+    Properties:
+      Budget:
+        BudgetName: !Sub "${AWS::StackName}-budget-10usd"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: 10
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+
+  CostBudget25:
+    Type: AWS::Budgets::Budget
+    Condition: HasAlertEmail
+    Properties:
+      Budget:
+        BudgetName: !Sub "${AWS::StackName}-budget-25usd"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: 25
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+
+  CostBudget50:
+    Type: AWS::Budgets::Budget
+    Condition: HasAlertEmail
+    Properties:
+      Budget:
+        BudgetName: !Sub "${AWS::StackName}-budget-50usd"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: 50
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+
+Outputs:
+  ServiceUrl:
+    Description: HTTPS URL of the App Runner application service
+    Value: !Sub "https://${AppRunnerService.ServiceUrl}"
+
+  ServiceId:
+    Description: App Runner Service ID
+    Value: !GetAtt AppRunnerService.ServiceId
+
+  ReportsTableName:
+    Description: DynamoDB Reports table name
+    Value: !Ref ReportsTable
+
+  VotesTableName:
+    Description: DynamoDB Votes table name
+    Value: !Ref VotesTable
+
+  ClearTimeLogTableName:
+    Description: DynamoDB Clear Time Log table name
+    Value: !Ref ClearTimeLogTable
+
+  PhotoBucketName:
+    Description: S3 Photo Bucket name
+    Value: !Ref PhotoBucket

@@ -1,5 +1,7 @@
 import os
 
+from fastapi import HTTPException
+
 from . import geometry
 from . import llm
 
@@ -200,6 +202,8 @@ def observe(image_bytes):
 
         return result
 
+    except HTTPException:
+        raise
     except Exception as exc:
         print(
             "Ollama perception error:",

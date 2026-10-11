@@ -19,6 +19,10 @@ DB = os.getenv(
 )
 
 
+def is_dynamo() -> bool:
+    return os.getenv("DB_BACKEND", "sqlite").strip().lower() == "dynamodb"
+
+
 def conn():
     os.makedirs(
         os.path.dirname(DB),
@@ -31,6 +35,10 @@ def conn():
 
 
 def init():
+    if is_dynamo():
+        from . import dynamo_db
+        return dynamo_db.init()
+
     with conn() as c:
         c.execute("""
             CREATE TABLE IF NOT EXISTS reports (
@@ -141,6 +149,10 @@ def init():
 
 
 def insert(r: Dict[str, Any]) -> str:
+    if is_dynamo():
+        from . import dynamo_db
+        return dynamo_db.insert(r)
+
     rid = uuid.uuid4().hex
     now = int(time.time())
     last_verified = r.get("last_verified") or r.get("capturedAt") or now
@@ -200,7 +212,11 @@ def insert(r: Dict[str, Any]) -> str:
     return rid
 
 
-def get_report(report_id: str) -> Optional[sqlite3.Row]:
+def get_report(report_id: str) -> Optional[Any]:
+    if is_dynamo():
+        from . import dynamo_db
+        return dynamo_db.get_report(report_id)
+
     with conn() as c:
         return c.execute(
             "SELECT * FROM reports WHERE id = ?",
@@ -222,6 +238,10 @@ def add_vote(report_id: str, device_id: str, vote: str) -> Dict[str, Any]:
     - two or more "cleared" votes from different devices mark report as cleared,
       EXCEPT if the photo report is newer than PHOTO_PROTECTION_SECONDS (10 min).
     """
+    if is_dynamo():
+        from . import dynamo_db
+        return dynamo_db.add_vote(report_id, device_id, vote)
+
     if vote not in ("still_flooded", "cleared"):
         raise ValueError("Invalid vote. Must be 'still_flooded' or 'cleared'.")
 
@@ -320,7 +340,11 @@ def add_vote(report_id: str, device_id: str, vote: str) -> Dict[str, Any]:
     }
 
 
-def nearby(bbox, include_cleared: bool = False) -> List[sqlite3.Row]:
+def nearby(bbox, include_cleared: bool = False) -> List[Any]:
+    if is_dynamo():
+        from . import dynamo_db
+        return dynamo_db.nearby(bbox, include_cleared)
+
     west, south, east, north = bbox
 
     with conn() as c:
@@ -363,6 +387,10 @@ def refresh_stale_reports(now: Optional[int] = None) -> int:
     Updates their updated_at to the transition timestamp (last_verified + stale_threshold)
     so polling queries pick up the stale transition.
     """
+    if is_dynamo():
+        from . import dynamo_db
+        return dynamo_db.refresh_stale_reports(now)
+
     now_ts = now if now is not None else int(time.time())
     stale_sec = int(os.getenv("STALE_THRESHOLD_SECONDS", 3600))
     with conn() as c:
@@ -386,6 +414,10 @@ def changed_since(bbox, since_ts: int) -> List[Dict[str, Any]]:
     Uses one updated_at value per report for clean polling.
     Keep signature simple so a DynamoDB version can be added later.
     """
+    if is_dynamo():
+        from . import dynamo_db
+        return dynamo_db.changed_since(bbox, since_ts)
+
     if isinstance(bbox, str):
         parts = [float(x.strip()) for x in bbox.split(",")]
         west, south, east, north = parts[0], parts[1], parts[2], parts[3]
@@ -432,6 +464,14 @@ def log_clear_time(
     likely_ts: Optional[int] = None,
     latest_ts: Optional[int] = None,
 ) -> str:
+    if is_dynamo():
+        from . import dynamo_db
+        return dynamo_db.log_clear_time(
+            road_id, lat, lng, vehicle, issued_at,
+            earliest, likely, latest, basis,
+            forecast_available, earliest_ts, likely_ts, latest_ts,
+        )
+
     log_id = uuid.uuid4().hex
     cell_key = f"{round(float(lat), 1)}_{round(float(lng), 1)}"
     with conn() as c:
@@ -475,6 +515,12 @@ def record_actual_cleared(
     Records actual clearance time for any pending logged estimates.
     Matches by road_id (if present) or proximity / grid cell.
     """
+    if is_dynamo():
+        from . import dynamo_db
+        return dynamo_db.record_actual_cleared(
+            road_id=road_id, lat=lat, lng=lng, cleared_at=cleared_at
+        )
+
     now = cleared_at if cleared_at is not None else int(time.time())
     with conn() as c:
         updated = 0
@@ -506,6 +552,10 @@ def record_actual_cleared(
 
 
 def get_clear_time_logs(limit: int = 200) -> List[Dict[str, Any]]:
+    if is_dynamo():
+        from . import dynamo_db
+        return dynamo_db.get_clear_time_logs(limit)
+
     with conn() as c:
         rows = c.execute(
             """
@@ -524,6 +574,12 @@ def get_recent_reports_for_road_or_cell(
     lng: Optional[float] = None,
     max_age_sec: int = 6 * 3600,
 ) -> List[Dict[str, Any]]:
+    if is_dynamo():
+        from . import dynamo_db
+        return dynamo_db.get_recent_reports_for_road_or_cell(
+            road_id=road_id, lat=lat, lng=lng, max_age_sec=max_age_sec
+        )
+
     now_ts = int(time.time())
     cutoff = now_ts - max_age_sec
     with conn() as c:
@@ -541,3 +597,22 @@ def get_recent_reports_for_road_or_cell(
             ).fetchall()
             return [dict(r) for r in rows]
         return []
+
+
+_LOCAL_DAILY_CAPS: Dict[str, int] = {}
+
+
+def check_and_increment_daily_cap(max_cap: int = 300) -> None:
+    if is_dynamo():
+        from . import dynamo_db
+        return dynamo_db.check_and_increment_daily_cap(max_cap=max_cap)
+
+    today_str = time.strftime("%Y-%m-%d", time.gmtime())
+    cnt = _LOCAL_DAILY_CAPS.get(today_str, 0)
+    if cnt >= max_cap:
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=429,
+            detail=f"Daily vision analysis cap reached ({max_cap} requests/day). Please try again tomorrow.",
+        )
+    _LOCAL_DAILY_CAPS[today_str] = cnt + 1
