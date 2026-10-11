@@ -511,6 +511,18 @@
             </div>
         </div>
 
+        <div id="analysisClearTimeCard" style="margin-top:10px; padding:10px 12px; background:rgba(30,41,59,0.85); border:1px solid rgba(56,189,248,0.4); border-radius:8px; display:none;">
+            <div style="font-size:10px; text-transform:uppercase; color:#93c5fd; font-weight:700; letter-spacing:0.5px;">
+                Estimated time to become safe
+            </div>
+            <div id="analysisClearTimeText" style="font-size:15px; font-weight:800; color:#38bdf8; margin-top:2px;">
+                —
+            </div>
+            <div id="analysisClearTimeNote" style="font-size:10px; color:#cbd5e1; margin-top:3px; font-style:italic;">
+                Estimate based on forecast rain and local drainage model.
+            </div>
+        </div>
+
         <div
             id="analysisModel"
             style="
@@ -1516,6 +1528,48 @@
             });
         }
 
+        function renderClearTime(result) {
+            const ctCard = document.getElementById("analysisClearTimeCard");
+            const ctText = document.getElementById("analysisClearTimeText");
+            if (!ctCard || !ctText) return;
+
+            if (!result) {
+                ctCard.style.display = "none";
+                return;
+            }
+
+            let ct = result.clear_time;
+            if (typeof ct === "string") {
+                try { ct = JSON.parse(ct); } catch (e) { ct = null; }
+            }
+
+            let safeText = null;
+            if (ct) {
+                if (ct.display_text) {
+                    safeText = ct.display_text;
+                } else if (ct.earliest && ct.latest) {
+                    safeText = (ct.earliest === ct.latest)
+                        ? ("about " + ct.earliest)
+                        : ("about " + ct.earliest + "–" + ct.latest);
+                } else if (ct.rain_note) {
+                    safeText = ct.rain_note;
+                } else if (ct.earliest) {
+                    safeText = "starting around " + ct.earliest;
+                } else if (ct.likely) {
+                    safeText = "about " + ct.likely;
+                }
+            } else if (result.clear_in_minutes != null) {
+                safeText = "in about " + Math.max(15, result.clear_in_minutes - 15) + "–" + (result.clear_in_minutes + 15) + " min";
+            }
+
+            if (safeText) {
+                ctText.textContent = safeText;
+                ctCard.style.display = "block";
+            } else {
+                ctCard.style.display = "none";
+            }
+        }
+
         function renderAnalysisVerdict(result) {
             const verdict =
                 result.verdicts &&
@@ -1538,6 +1592,8 @@
             } else {
                 el.style.color = "#888888";
             }
+
+            renderClearTime(result);
         }
 
         function showAnalysis(result) {
@@ -1847,7 +1903,7 @@
                                     }
 
                                     ${
-                                        (!["PASSABLE", "REPORTED_CLEAR"].includes(status) && (["CAUTION", "FLOODED", "BLOCKED", "STALE"].includes(status) || p.is_stale))
+                                        (!["PASSABLE", "REPORTED_CLEAR"].includes(status))
                                         ? (() => {
                                             let ct = p.clear_time;
                                             if (typeof ct === "string") {
@@ -1865,6 +1921,8 @@
                                                     safeText = ct.rain_note;
                                                 } else if (ct.earliest) {
                                                     safeText = "starting around " + ct.earliest;
+                                                } else if (ct.likely) {
+                                                    safeText = "about " + ct.likely;
                                                 }
                                             } else if (p.clear_in_minutes != null) {
                                                 safeText = "in about " + Math.max(15, p.clear_in_minutes - 15) + "-" + (p.clear_in_minutes + 15) + " min";
