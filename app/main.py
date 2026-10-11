@@ -37,6 +37,7 @@ from .common import (
     environment,
     detector,
     fusion,
+    clear_time,
 )
 from .common.rate_limit import check_rate_limit
 
@@ -107,6 +108,8 @@ class ReportRequest(BaseModel):
     accuracy: Optional[float] = None
     capturedAt: Optional[int] = None
     deviceId: Optional[str] = None
+    mode: Optional[str] = "hatchback"
+    vehicle: Optional[str] = None
 
 
 class ConfirmRequest(BaseModel):
@@ -620,6 +623,54 @@ def build_road_features(
                     )
                     clearance = None
 
+                clear_time_data = None
+                if road_status not in ("PASSABLE", "REPORTED_CLEAR", "UNKNOWN"):
+                    try:
+                        recent_reps = db.get_recent_reports_for_road_or_cell(
+                            road_id=road["id"],
+                            lat=closest_report["lat"],
+                            lng=closest_report["lng"],
+                        )
+                        physics_ct = clear_time.estimate_clear_time(
+                            closest_report["lat"],
+                            closest_report["lng"],
+                            (
+                                float(closest_report.get("depth_lo", max_depth)),
+                                float(closest_report.get("depth_hi", max_depth)),
+                            ),
+                            vehicle=mode,
+                            highway=road.get("highway", "residential"),
+                            recent_reports=recent_reps,
+                        )
+                        db.log_clear_time(
+                            road_id=road["id"],
+                            lat=closest_report["lat"],
+                            lng=closest_report["lng"],
+                            vehicle=mode,
+                            issued_at=now_ts,
+                            earliest=physics_ct["earliest"],
+                            likely=physics_ct["likely"],
+                            latest=physics_ct["latest"],
+                            basis=physics_ct["basis"],
+                            forecast_available=physics_ct["forecast_available"],
+                            earliest_ts=physics_ct.get("earliest_ts"),
+                            likely_ts=physics_ct.get("likely_ts"),
+                            latest_ts=physics_ct.get("latest_ts"),
+                        )
+                        clear_time_data = {
+                            "vehicle": physics_ct["vehicle"],
+                            "earliest": physics_ct["earliest"],
+                            "likely": physics_ct["likely"],
+                            "latest": physics_ct["latest"],
+                            "basis": physics_ct["basis"],
+                            "rain_note": physics_ct["rain_note"],
+                            "forecast_available": physics_ct["forecast_available"],
+                            "display_text": physics_ct["display_text"],
+                        }
+                    except Exception as ct_exc:
+                        print("Error estimating physics clear time:", repr(ct_exc))
+                        clear_time_data = None
+
                 properties.update({
                     "status":
                         road_status,
@@ -793,9 +844,7 @@ def build_road_features(
                         ),
 
                     "clear_time":
-                        clearance.get(
-                            "estimated_clear_time"
-                        ),
+                        clear_time_data,
 
                     "passable_depth_cm":
                         clearance.get(
@@ -1252,6 +1301,48 @@ def report(req: ReportRequest):
             result["image_usable"],
     })
 
+    veh = req.vehicle or req.mode or "hatchback"
+    if veh not in MODES:
+        veh = "hatchback"
+
+    depth_lo = float(result["depth_cm"][0]) if result.get("depth_cm") else 0.0
+    depth_hi = float(result["depth_cm"][1]) if result.get("depth_cm") else 0.0
+
+    recent_reps = db.get_recent_reports_for_road_or_cell(lat=req.lat, lng=req.lng)
+    ct = clear_time.estimate_clear_time(
+        lat=req.lat,
+        lng=req.lng,
+        depth_interval=(depth_lo, depth_hi),
+        vehicle=veh,
+        highway="residential",
+        recent_reports=recent_reps,
+    )
+    result["clear_time"] = {
+        "vehicle": ct["vehicle"],
+        "earliest": ct["earliest"],
+        "likely": ct["likely"],
+        "latest": ct["latest"],
+        "basis": ct["basis"],
+        "rain_note": ct["rain_note"],
+        "forecast_available": ct["forecast_available"],
+        "display_text": ct["display_text"],
+    }
+    db.log_clear_time(
+        road_id=None,
+        lat=req.lat,
+        lng=req.lng,
+        vehicle=veh,
+        issued_at=int(time.time()),
+        earliest=ct["earliest"],
+        likely=ct["likely"],
+        latest=ct["latest"],
+        basis=ct["basis"],
+        forecast_available=ct["forecast_available"],
+        earliest_ts=ct.get("earliest_ts"),
+        likely_ts=ct.get("likely_ts"),
+        latest_ts=ct.get("latest_ts"),
+    )
+
     print(
         "Analysis complete:",
         result,
@@ -1590,6 +1681,28 @@ def map_updates(
 
         band_val = row.get("band") or "unknown"
 
+        clear_time_data = None
+        if status in ("CAUTION", "FLOODED", "BLOCKED", "STALE"):
+            try:
+                ct = clear_time.estimate_clear_time(
+                    float(row["lat"]),
+                    float(row["lng"]),
+                    (float(row.get("depth_lo", 0) or 0), float(row.get("depth_hi", 0) or 0)),
+                    vehicle=selected_mode,
+                )
+                clear_time_data = {
+                    "vehicle": ct["vehicle"],
+                    "earliest": ct["earliest"],
+                    "likely": ct["likely"],
+                    "latest": ct["latest"],
+                    "basis": ct["basis"],
+                    "rain_note": ct["rain_note"],
+                    "forecast_available": ct["forecast_available"],
+                    "display_text": ct["display_text"],
+                }
+            except Exception:
+                clear_time_data = None
+
         changes.append({
             "report_id": row.get("id"),
             "road_id": matched_road_id,
@@ -1603,6 +1716,7 @@ def map_updates(
             "verdicts": verdicts,
             "last_verified": last_verified_ts,
             "change_type": change_type,
+            "clear_time": clear_time_data,
         })
 
     return {

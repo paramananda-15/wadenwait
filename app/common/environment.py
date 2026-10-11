@@ -3,6 +3,9 @@ import math
 import time
 import urllib.parse
 import urllib.request
+from typing import Optional, Dict, Any, Tuple, List
+
+from . import clear_time as ct_module
 
 
 OPEN_METEO_WEATHER = (
@@ -608,8 +611,20 @@ def estimate_road_clearance(
             current,
 
         "confidence":
-            "estimated"
+            "estimated",
+
+        "clear_time":
+            ct_module.estimate_clear_time(
+                lat,
+                lng,
+                (float(current_depth_cm), float(current_depth_cm)),
+                vehicle=mode,
+                highway=road_type,
+            ),
     }
+
+
+get_clear_time = ct_module.estimate_clear_time
 
 
 def forecast_reopening(

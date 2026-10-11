@@ -99,6 +99,46 @@ def init():
             ON report_votes(report_id)
         """)
 
+        # Clear time estimate logging table
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS clear_time_log (
+                id TEXT PRIMARY KEY,
+                road_id TEXT,
+                lat REAL,
+                lng REAL,
+                cell_key TEXT,
+                vehicle TEXT,
+                issued_at INTEGER,
+                earliest TEXT,
+                likely TEXT,
+                latest TEXT,
+                earliest_ts INTEGER,
+                likely_ts INTEGER,
+                latest_ts INTEGER,
+                basis TEXT,
+                forecast_available INTEGER,
+                actual_cleared_at INTEGER
+            )
+        """)
+
+        c.execute("""
+            CREATE INDEX IF NOT EXISTS
+            idx_ctl_road
+            ON clear_time_log(road_id)
+        """)
+
+        c.execute("""
+            CREATE INDEX IF NOT EXISTS
+            idx_ctl_cell
+            ON clear_time_log(cell_key)
+        """)
+
+        c.execute("""
+            CREATE INDEX IF NOT EXISTS
+            idx_ctl_pending
+            ON clear_time_log(actual_cleared_at)
+        """)
+
 
 def insert(r: Dict[str, Any]) -> str:
     rid = uuid.uuid4().hex
@@ -189,7 +229,7 @@ def add_vote(report_id: str, device_id: str, vote: str) -> Dict[str, Any]:
 
     with conn() as c:
         rep = c.execute(
-            "SELECT id, captured_at, created_at, last_verified, cleared FROM reports WHERE id = ?",
+            "SELECT id, lat, lng, captured_at, created_at, last_verified, cleared FROM reports WHERE id = ?",
             (report_id,),
         ).fetchone()
 
@@ -253,6 +293,8 @@ def add_vote(report_id: str, device_id: str, vote: str) -> Dict[str, Any]:
                 )
                 is_cleared = True
                 last_verified = now
+                rep_lat = rep["lat"] if "lat" in rep.keys() else None
+                rep_lng = rep["lng"] if "lng" in rep.keys() else None
             else:
                 # Vote is counted in report_votes, but photo is recent: keep road marked flooded
                 c.execute(
@@ -261,6 +303,11 @@ def add_vote(report_id: str, device_id: str, vote: str) -> Dict[str, Any]:
                 )
                 is_cleared = bool(rep["cleared"]) and not is_photo_protected
                 last_verified = now
+                rep_lat = None
+                rep_lng = None
+
+    if is_cleared and rep_lat is not None and rep_lng is not None:
+        record_actual_cleared(lat=rep_lat, lng=rep_lng, cleared_at=now)
 
     return {
         "ok": True,
@@ -368,3 +415,129 @@ def changed_since(bbox, since_ts: int) -> List[Dict[str, Any]]:
             ),
         ).fetchall()
         return [dict(row) for row in rows]
+
+
+def log_clear_time(
+    road_id: Optional[str],
+    lat: float,
+    lng: float,
+    vehicle: str,
+    issued_at: int,
+    earliest: Optional[str],
+    likely: Optional[str],
+    latest: Optional[str],
+    basis: str,
+    forecast_available: bool = True,
+    earliest_ts: Optional[int] = None,
+    likely_ts: Optional[int] = None,
+    latest_ts: Optional[int] = None,
+) -> str:
+    log_id = uuid.uuid4().hex
+    cell_key = f"{round(float(lat), 1)}_{round(float(lng), 1)}"
+    with conn() as c:
+        c.execute(
+            """
+            INSERT INTO clear_time_log (
+                id, road_id, lat, lng, cell_key, vehicle, issued_at,
+                earliest, likely, latest, earliest_ts, likely_ts, latest_ts,
+                basis, forecast_available, actual_cleared_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            """,
+            (
+                log_id,
+                road_id,
+                float(lat),
+                float(lng),
+                cell_key,
+                vehicle,
+                int(issued_at),
+                earliest,
+                likely,
+                latest,
+                earliest_ts,
+                likely_ts,
+                latest_ts,
+                basis,
+                1 if forecast_available else 0,
+            ),
+        )
+    return log_id
+
+
+def record_actual_cleared(
+    road_id: Optional[str] = None,
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
+    cleared_at: Optional[int] = None,
+) -> int:
+    """
+    Records actual clearance time for any pending logged estimates.
+    Matches by road_id (if present) or proximity / grid cell.
+    """
+    now = cleared_at if cleared_at is not None else int(time.time())
+    with conn() as c:
+        updated = 0
+        if road_id:
+            res = c.execute(
+                """
+                UPDATE clear_time_log
+                SET actual_cleared_at = ?
+                WHERE road_id = ? AND actual_cleared_at IS NULL
+                """,
+                (now, road_id),
+            )
+            updated += res.rowcount
+
+        if lat is not None and lng is not None:
+            cell_key = f"{round(float(lat), 1)}_{round(float(lng), 1)}"
+            res = c.execute(
+                """
+                UPDATE clear_time_log
+                SET actual_cleared_at = ?
+                WHERE (cell_key = ? OR (lat BETWEEN ? AND ? AND lng BETWEEN ? AND ?))
+                  AND actual_cleared_at IS NULL
+                """,
+                (now, cell_key, float(lat) - 0.005, float(lat) + 0.005, float(lng) - 0.005, float(lng) + 0.005),
+            )
+            updated += res.rowcount
+
+        return updated
+
+
+def get_clear_time_logs(limit: int = 200) -> List[Dict[str, Any]]:
+    with conn() as c:
+        rows = c.execute(
+            """
+            SELECT * FROM clear_time_log
+            ORDER BY issued_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_recent_reports_for_road_or_cell(
+    road_id: Optional[str] = None,
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
+    max_age_sec: int = 6 * 3600,
+) -> List[Dict[str, Any]]:
+    now_ts = int(time.time())
+    cutoff = now_ts - max_age_sec
+    with conn() as c:
+        if lat is not None and lng is not None:
+            # Query within ~0.02 deg (approx 2 km)
+            rows = c.execute(
+                """
+                SELECT * FROM reports
+                WHERE lat BETWEEN ? AND ?
+                  AND lng BETWEEN ? AND ?
+                  AND coalesce(captured_at, created_at) >= ?
+                ORDER BY coalesce(captured_at, created_at) ASC
+                """,
+                (float(lat) - 0.02, float(lat) + 0.02, float(lng) - 0.02, float(lng) + 0.02, cutoff),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        return []

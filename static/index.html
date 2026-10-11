@@ -1842,72 +1842,44 @@
                                     }
 
                                     ${
-                                        p.clear_in_minutes != null
-                                        ? `
-                                        <div style="
-                                            margin-top:9px;
-                                            padding-top:9px;
-                                            border-top:1px solid #ddd;
-                                        ">
-                                            <div style="
-                                                font-size:10px;
-                                                color:#777;
-                                                text-transform:uppercase;
-                                            ">
-                                                Estimated reopening
-                                            </div>
-
-                                            <div style="
-                                                font-size:16px;
-                                                font-weight:900;
-                                                margin-top:3px;
-                                            ">
-                                                ${escapeHtml(
-                                                    formatMinutes(
-                                                        p.clear_in_minutes
-                                                    )
-                                                )}
-                                            </div>
-
-                                            <div class="small">
-                                                Rain expected:
-                                                ${escapeHtml(
-                                                    formatMinutes(
-                                                        p.rain_minutes
-                                                    )
-                                                )}
-                                            </div>
-
-                                            <div class="small">
-                                                Forecast rain:
-                                                ${escapeHtml(
-                                                    p.forecast_rain_mm != null
-                                                        ? `${p.forecast_rain_mm} mm`
-                                                        : "Unknown"
-                                                )}
-                                            </div>
-
-                                            ${
-                                                p.weather &&
-                                                p.weather.temperature_c != null
-                                                ? `
-                                                <div class="small">
-                                                    Weather:
-                                                    ${escapeHtml(
-                                                        Number(
-                                                            p.weather.temperature_c
-                                                        ).toFixed(1)
-                                                    )}°C,
-                                                    rain
-                                                    ${escapeHtml(
-                                                        p.weather.rain_mm || 0
-                                                    )} mm/h
-                                                </div>
-                                                `
-                                                : ""
+                                        (!["PASSABLE", "REPORTED_CLEAR"].includes(status) && (["CAUTION", "FLOODED", "BLOCKED", "STALE"].includes(status) || p.is_stale))
+                                        ? (() => {
+                                            let ct = p.clear_time;
+                                            if (typeof ct === "string") {
+                                                try { ct = JSON.parse(ct); } catch (e) { ct = null; }
                                             }
-                                        </div>
-                                        `
+                                            let safeText = null;
+                                            if (ct) {
+                                                if (ct.display_text) {
+                                                    safeText = ct.display_text;
+                                                } else if (ct.earliest && ct.latest) {
+                                                    safeText = (ct.earliest === ct.latest)
+                                                        ? ("about " + ct.earliest)
+                                                        : ("about " + ct.earliest + "-" + ct.latest);
+                                                } else if (ct.rain_note) {
+                                                    safeText = ct.rain_note;
+                                                } else if (ct.earliest) {
+                                                    safeText = "starting around " + ct.earliest;
+                                                }
+                                            } else if (p.clear_in_minutes != null) {
+                                                safeText = "in about " + Math.max(15, p.clear_in_minutes - 15) + "-" + (p.clear_in_minutes + 15) + " min";
+                                            }
+                                            if (!safeText) return "";
+                                            return `
+                                            <div style="
+                                                margin-top:9px;
+                                                padding-top:9px;
+                                                border-top:1px solid #ddd;
+                                            ">
+                                                <div style="font-size:12px; font-weight:700; color:#1e293b;">
+                                                    Estimated safe for your vehicle: ${escapeHtml(safeText)}
+                                                </div>
+                                                <div style="font-size:10px; font-style:italic; color:#888; margin-top:3px; line-height:1.3;">
+                                                    Estimate only - based on forecast rain and a simple drainage model. Always check the road yourself.
+                                                </div>
+                                            </div>
+                                            `;
+                                        })()
                                         : ""
                                     }
                                 </div>
