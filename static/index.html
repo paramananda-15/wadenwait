@@ -477,6 +477,43 @@
     <script>
         const API = window.location.origin;
 
+        function getDeviceId() {
+            let dev = localStorage.getItem("wade_deviceId");
+            if (!dev) {
+                dev = "dev_" + Math.random().toString(36).substring(2, 12);
+                localStorage.setItem("wade_deviceId", dev);
+            }
+            return dev;
+        }
+
+        window.voteReport = async function(reportId, status) {
+            if (!reportId) return;
+            const msgEl = document.getElementById(`voteMsg_${reportId}`);
+            if (msgEl) msgEl.textContent = "Recording vote...";
+            try {
+                const res = await fetch(`${API}/reports/${encodeURIComponent(reportId)}/confirm`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ status: status, deviceId: getDeviceId() })
+                });
+                if (!res.ok) throw new Error("Vote failed");
+                const data = await res.json();
+                if (msgEl) {
+                    if (data.ignored) {
+                        msgEl.textContent = "Vote already recorded from this device.";
+                    } else if (status === "still_flooded") {
+                        msgEl.textContent = "Verified: road still flooded.";
+                    } else {
+                        msgEl.textContent = data.cleared ? "Road confirmed clear!" : "Clear vote recorded.";
+                    }
+                }
+                await loadRoads();
+            } catch (err) {
+                console.error(err);
+                if (msgEl) msgEl.textContent = "Vote failed. Please try again.";
+            }
+        };
+
         let selectedVehicle = "hatchback";
         let userPosition = null;
         let roadRequestTimer = null;
@@ -577,7 +614,11 @@
                         14, 4,
                         18, 7
                     ],
-                    "line-opacity": 0.9
+                    "line-opacity": [
+                        "coalesce",
+                        ["get", "opacity"],
+                        0.9
+                    ]
                 }
             });
 
@@ -600,7 +641,11 @@
                         14, 5,
                         18, 8
                     ],
-                    "line-opacity": 0.95
+                    "line-opacity": [
+                        "coalesce",
+                        ["get", "opacity"],
+                        0.95
+                    ]
                 }
             });
 
@@ -623,7 +668,11 @@
                         14, 6,
                         18, 10
                     ],
-                    "line-opacity": 1
+                    "line-opacity": [
+                        "coalesce",
+                        ["get", "opacity"],
+                        1.0
+                    ]
                 }
             });
 
@@ -646,7 +695,11 @@
                         14, 7,
                         18, 12
                     ],
-                    "line-opacity": 1
+                    "line-opacity": [
+                        "coalesce",
+                        ["get", "opacity"],
+                        1.0
+                    ]
                 }
             });
 
@@ -1009,7 +1062,7 @@
                                     ),
 
                                 deviceId:
-                                    "web"
+                                    getDeviceId()
                             })
                         }
                     );
@@ -1302,6 +1355,69 @@
                                             ) * 100
                                         )}%
                                     </div>
+
+                                    ${
+                                        p.last_verified_minutes != null
+                                        ? `
+                                        <div class="small" style="color:#2563eb; font-weight:600; margin-top:3px;">
+                                            Last verified: ${p.last_verified_minutes <= 0 ? "just now" : p.last_verified_minutes + " min ago"}
+                                        </div>
+                                        `
+                                        : ""
+                                    }
+
+                                    ${
+                                        p.report_id
+                                        ? `
+                                        <div style="
+                                            margin-top:10px;
+                                            padding-top:8px;
+                                            border-top:1px solid #ddd;
+                                        ">
+                                            <div style="font-size:10px; color:#777; text-transform:uppercase; margin-bottom:5px;">
+                                                Crowd confirmation
+                                            </div>
+                                            <div style="display:flex; gap:6px;">
+                                                <button
+                                                    type="button"
+                                                    style="
+                                                        flex:1;
+                                                        padding:6px 4px;
+                                                        font-size:11px;
+                                                        font-weight:700;
+                                                        background:#dc2626;
+                                                        color:#fff;
+                                                        border:0;
+                                                        border-radius:6px;
+                                                        cursor:pointer;
+                                                    "
+                                                    onclick="voteReport('${escapeHtml(p.report_id)}', 'still_flooded')"
+                                                >
+                                                    Still flooded
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    style="
+                                                        flex:1;
+                                                        padding:6px 4px;
+                                                        font-size:11px;
+                                                        font-weight:700;
+                                                        background:#16a34a;
+                                                        color:#fff;
+                                                        border:0;
+                                                        border-radius:6px;
+                                                        cursor:pointer;
+                                                    "
+                                                    onclick="voteReport('${escapeHtml(p.report_id)}', 'cleared')"
+                                                >
+                                                    It's clear
+                                                </button>
+                                            </div>
+                                            <div id="voteMsg_${escapeHtml(p.report_id)}" class="small" style="margin-top:4px; font-size:10px; color:#555;"></div>
+                                        </div>
+                                        `
+                                        : ""
+                                    }
 
                                     ${
                                         p.clear_in_minutes != null

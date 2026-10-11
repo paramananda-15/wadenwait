@@ -67,8 +67,41 @@ function drawPins(pins) {
   for (const p of pins) {
     const v = (p.verdicts||{})[mode] || "UNKNOWN";
     const el = document.createElement("div"); el.className = "pin"; el.style.background = COLORS[v];
+    if (p.opacity != null) el.style.opacity = p.opacity;
     const box = document.createElement("div");
-    box.textContent = `${LABEL[v]} for ${MODES[mode].toLowerCase()} · water ~${p.band} (${p.depth_cm[0]}–${p.depth_cm[1]} cm) · ${p.reports} report${p.reports>1?"s":""}`;
+    let desc = `${LABEL[v]} for ${MODES[mode].toLowerCase()} · water ~${p.band} (${p.depth_cm[0]}–${p.depth_cm[1]} cm) · ${p.reports} report${p.reports>1?"s":""}`;
+    if (p.last_verified_minutes != null) {
+      desc += ` · last verified ${p.last_verified_minutes <= 0 ? "just now" : p.last_verified_minutes + "m ago"}`;
+    }
+    const t = document.createElement("div"); t.textContent = desc; box.appendChild(t);
+    if (p.report_id) {
+      const btnRow = document.createElement("div");
+      btnRow.style.cssText = "margin-top:6px;display:flex;gap:4px";
+      const b1 = document.createElement("button");
+      b1.textContent = "Still flooded";
+      b1.style.cssText = "font-size:11px;background:#dc2626;color:#fff;border:0;border-radius:4px;padding:3px 6px;cursor:pointer";
+      b1.onclick = async () => {
+        await fetch(API + "/reports/" + p.report_id + "/confirm", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({status: "still_flooded", deviceId: device})
+        });
+        refresh();
+      };
+      const b2 = document.createElement("button");
+      b2.textContent = "It's clear";
+      b2.style.cssText = "font-size:11px;background:#16a34a;color:#fff;border:0;border-radius:4px;padding:3px 6px;cursor:pointer";
+      b2.onclick = async () => {
+        await fetch(API + "/reports/" + p.report_id + "/confirm", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({status: "cleared", deviceId: device})
+        });
+        refresh();
+      };
+      btnRow.append(b1, b2);
+      box.appendChild(btnRow);
+    }
     const popup = new maplibregl.Popup({offset:14}).setDOMContent(box);
     markers.push(new maplibregl.Marker({element:el}).setLngLat([p.lng,p.lat]).setPopup(popup).addTo(map));
   }

@@ -101,6 +101,12 @@ class ReportRequest(BaseModel):
     deviceId: Optional[str] = None
 
 
+class ConfirmRequest(BaseModel):
+    status: str
+    deviceId: Optional[str] = None
+    device_id: Optional[str] = None
+
+
 def haversine_m(lat1, lng1, lat2, lng2):
     earth_radius = 6371000.0
 
@@ -487,6 +493,18 @@ def build_road_features(
 
             "clearance_confidence":
                 None,
+
+            "last_verified":
+                None,
+
+            "last_verified_minutes":
+                None,
+
+            "opacity":
+                0.35,
+
+            "report_id":
+                None,
         }
 
         if matching:
@@ -554,6 +572,15 @@ def build_road_features(
 
                 clearance = None
 
+            now_ts = int(time.time())
+            last_verified_ts = max(
+                (item[1].get("last_verified") or item[1].get("captured_at") or now_ts)
+                for item in matching
+            )
+            age_sec = max(0, now_ts - last_verified_ts)
+            age_min = round(age_sec / 60)
+            fade = max(0.35, min(1.0, 1.0 - (age_sec / (180.0 * 60.0)) * 0.65))
+
             properties.update({
                 "status":
                     classify_road(
@@ -580,6 +607,18 @@ def build_road_features(
                     max(timestamps)
                     if timestamps
                     else None,
+
+                "last_verified":
+                    last_verified_ts,
+
+                "last_verified_minutes":
+                    age_min,
+
+                "opacity":
+                    round(fade, 2),
+
+                "report_id":
+                    closest_report.get("id"),
             })
 
             if clearance:
@@ -1071,6 +1110,27 @@ def report(req: ReportRequest):
     return result
 
 
+@app.post("/reports/{id}/confirm")
+def confirm_report(id: str, req: ConfirmRequest):
+    if req.status not in ("still_flooded", "cleared"):
+        raise HTTPException(
+            status_code=400,
+            detail="status must be 'still_flooded' or 'cleared'",
+        )
+
+    device_id = req.deviceId or req.device_id or "unknown_device"
+
+    rep = db.get_report(id)
+    if not rep:
+        raise HTTPException(
+            status_code=404,
+            detail="report not found",
+        )
+
+    res = db.add_vote(id, device_id, req.status)
+    return res
+
+
 @app.get("/map")
 def map_pins(
     bbox: str,
@@ -1186,6 +1246,27 @@ def map_pins(
 
             "verdicts":
                 verdicts,
+
+            "last_verified":
+                max(
+                    (row["last_verified"] if "last_verified" in row.keys() and row["last_verified"] else (row["created_at"] if "created_at" in row.keys() and row["created_at"] else int(time.time())))
+                    for row in rows_in_group
+                ),
+
+            "last_verified_minutes":
+                round(max(0, int(time.time()) - max(
+                    (row["last_verified"] if "last_verified" in row.keys() and row["last_verified"] else (row["created_at"] if "created_at" in row.keys() and row["created_at"] else int(time.time())))
+                    for row in rows_in_group
+                )) / 60),
+
+            "opacity":
+                round(max(0.35, min(1.0, 1.0 - (max(0, int(time.time()) - max(
+                    (row["last_verified"] if "last_verified" in row.keys() and row["last_verified"] else (row["created_at"] if "created_at" in row.keys() and row["created_at"] else int(time.time())))
+                    for row in rows_in_group
+                )) / (180.0 * 60.0)) * 0.65)), 2),
+
+            "report_id":
+                rows_in_group[0]["id"],
         })
 
     return {
@@ -1323,6 +1404,9 @@ def roads(
 
     for row in rows:
         reports.append({
+            "id":
+                row["id"],
+
             "lat":
                 float(row["lat"]),
 
@@ -1340,6 +1424,9 @@ def roads(
 
             "captured_at":
                 row["captured_at"],
+
+            "last_verified":
+                row["last_verified"] if "last_verified" in row.keys() and row["last_verified"] else row["captured_at"],
         })
 
     features = build_road_features(
